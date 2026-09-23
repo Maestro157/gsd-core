@@ -1145,6 +1145,10 @@ objective: Manual review needed
     // An executed standard plan (no gap_closure key).
     fs.writeFileSync(path.join(phaseDir, '34-01-PLAN.md'), '---\nwave: 1\n---\n<objective>Original plan.</objective>\n');
     fs.writeFileSync(path.join(phaseDir, '34-01-SUMMARY.md'), '---\nphase: 34\nplan: 01\n---\n# Summary\n');
+    // An executed gap-closure plan: gap_closure must survive has_summary
+    // flipping true (the issue saw it null both before and after the run).
+    fs.writeFileSync(path.join(phaseDir, '34-21-PLAN.md'), '---\nwave: 1\ngap_closure: true\n---\n<objective>Executed gap.</objective>\n');
+    fs.writeFileSync(path.join(phaseDir, '34-21-SUMMARY.md'), '---\nphase: 34\nplan: 21\n---\n# Summary\n');
     // Two ready gap-closure plans, as `/gsd-plan-phase 34 --gaps` writes them.
     fs.writeFileSync(path.join(phaseDir, '34-22-PLAN.md'), '---\nwave: 1\ngap_closure: true\n---\n<objective>Gap A.</objective>\n');
     fs.writeFileSync(path.join(phaseDir, '34-23-PLAN.md'), '---\nwave: 1\ngap_closure: true\n---\n<objective>Gap B.</objective>\n');
@@ -1160,6 +1164,7 @@ objective: Manual review needed
     const gapClosureById = Object.fromEntries(output.plans.map((p) => [p.id, p.gap_closure]));
     assert.deepStrictEqual(gapClosureById, {
       '34-01': false,
+      '34-21': true,
       '34-22': true,
       '34-23': true,
       '34-24': false,
@@ -1169,6 +1174,7 @@ objective: Manual review needed
     // The documented --gaps-only selection over this payload: incomplete plans
     // whose gap_closure is true. Before the fix this was [].
     const byId = new Map(output.plans.map((p) => [p.id, p]));
+    assert.strictEqual(byId.get('34-21').has_summary, true);
     const gapsOnly = output.incomplete.filter((id) => byId.get(id).gap_closure === true);
     assert.deepStrictEqual(gapsOnly, ['34-22', '34-23']);
   });
