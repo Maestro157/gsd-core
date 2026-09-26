@@ -700,12 +700,12 @@ None
     assert.match(state, /- Vendor quote updated from \$1\.00 to \$2\.00 pending approval/);
   });
 
-  // #4926: a text file outside the project root is still refused (containment
-  // is deliberate), but the refusal used to be `{ added: false }` at exit 0 —
-  // a caller gating on `$?` read success while nothing was written.
-  describe('#4926 refused text-file inputs exit non-zero and leave STATE.md untouched', () => {
+  // #4926: the text-file flags take a read-once INPUT, so a readable file
+  // anywhere is accepted (it used to be confined to the project root), and an
+  // unreadable one is refused through the fault path — it used to be
+  // `{ added: false }` at exit 0, which a caller gating on `$?` read as success.
+  describe('#4926 text-file inputs: any readable file is accepted; an unreadable one exits non-zero', () => {
     let outsideDir;
-    let outsideFile;
     const stateBody = `# Project State
 
 ## Decisions
@@ -717,60 +717,85 @@ None
 ## Roadmap Evolution
 None
 `;
+    const statePath = () => path.join(tmpDir, '.planning', 'STATE.md');
 
     beforeEach(() => {
-      fs.writeFileSync(path.join(tmpDir, '.planning', 'STATE.md'), stateBody);
+      fs.writeFileSync(statePath(), stateBody);
       outsideDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-4926-outside-'));
-      outsideFile = path.join(outsideDir, 'text.md');
-      fs.writeFileSync(outsideFile, 'A throwaway entry.\n');
     });
 
     afterEach(() => {
       cleanup(outsideDir);
     });
 
-    const cases = [
-      { name: 'add-decision --summary-file', argv: (f) => ['state', 'add-decision', '--summary-file', f], inline: '--summary' },
-      { name: 'add-decision --rationale-file', argv: (f) => ['state', 'add-decision', '--summary', 'ok', '--rationale-file', f], inline: '--rationale' },
-      { name: 'add-blocker --text-file', argv: (f) => ['state', 'add-blocker', '--text-file', f], inline: '--text' },
-      { name: 'add-roadmap-evolution --note-file', argv: (f) => ['state', 'add-roadmap-evolution', '--note-file', f], inline: '--note' },
+    const flags = [
+      { name: 'add-decision --summary-file', argv: (f) => ['state', 'add-decision', '--phase', '3', '--summary-file', f], flag: '--summary-file' },
+      { name: 'add-decision --rationale-file', argv: (f) => ['state', 'add-decision', '--phase', '3', '--summary', 'Chosen', '--rationale-file', f], flag: '--rationale-file' },
+      { name: 'add-blocker --text-file', argv: (f) => ['state', 'add-blocker', '--text-file', f], flag: '--text-file' },
+      { name: 'add-roadmap-evolution --note-file', argv: (f) => ['state', 'add-roadmap-evolution', '--phase', '3', '--note-file', f], flag: '--note-file' },
     ];
 
-    for (const c of cases) {
-      test(`${c.name} outside the project root exits 1 with reason usage and names ${c.inline}`, () => {
-        const result = runGsdTools([...c.argv(outsideFile), '--json-errors'], tmpDir);
+    // Where a scratch file can live relative to the project root.
+    const locations = [
+      { name: 'an unrelated absolute temp path', make: () => path.join(outsideDir, 'entry.md') },
+      { name: 'a sibling directory of the project', make: () => {
+        const siblingDir = path.join(path.dirname(tmpDir), `${path.basename(tmpDir)}-sibling-4926`);
+        fs.mkdirSync(siblingDir, { recursive: true });
+        return path.join(siblingDir, 'entry.md');
+      } },
+      { name: 'the parent directory of the project', make: () => path.join(path.dirname(tmpDir), `gsd-4926-parent-${path.basename(tmpDir)}.md`) },
+    ];
+
+    for (const f of flags) {
+      for (const loc of locations) {
+        test(`${f.name} accepts a readable file in ${loc.name}`, () => {
+          const file = loc.make();
+          fs.writeFileSync(file, 'Scratch entry 4926 $1.00\n');
+          try {
+            const result = runGsdTools(f.argv(file), tmpDir);
+
+            assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
+            assert.strictEqual(JSON.parse(result.output).added, true);
+            assert.ok(fs.readFileSync(statePath(), 'utf-8').includes('Scratch entry 4926 $1.00'), 'the file contents must reach STATE.md');
+          } finally {
+            cleanup(path.basename(path.dirname(file)).endsWith('-sibling-4926') ? path.dirname(file) : file);
+          }
+        });
+      }
+
+      test(`${f.name} naming a missing file exits 1 with reason usage and leaves STATE.md untouched`, () => {
+        const result = runGsdTools([...f.argv(path.join(outsideDir, 'missing.md')), '--json-errors'], tmpDir);
 
         assert.strictEqual(result.exitCode, 1, `refusal must exit non-zero; stdout: ${result.output}`);
         const envelope = JSON.parse(result.error);
         assert.strictEqual(envelope.ok, false);
         assert.strictEqual(envelope.reason, ERROR_REASON.USAGE);
-        assert.ok(envelope.message.includes(`${c.inline} instead`), `refusal must name the inline flag; got: ${envelope.message}`);
-        assert.strictEqual(fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
+        assert.ok(envelope.message.startsWith(`${f.flag} could not be read`), `refusal must name the flag; got: ${envelope.message}`);
+        assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
       });
     }
 
-    test('a --summary-file inside the root that does not exist exits 1 with reason usage', () => {
-      const result = runGsdTools(['state', 'add-decision', '--summary-file', '.planning/missing.md', '--json-errors'], tmpDir);
+    test('a directory passed as --summary-file is refused the same way', () => {
+      const result = runGsdTools(['state', 'add-decision', '--summary-file', outsideDir, '--json-errors'], tmpDir);
 
-      assert.strictEqual(result.exitCode, 1, `missing input file must exit non-zero; stdout: ${result.output}`);
+      assert.strictEqual(result.exitCode, 1);
       assert.strictEqual(JSON.parse(result.error).reason, ERROR_REASON.USAGE);
-      assert.strictEqual(fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8'), stateBody);
+      assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody);
     });
 
     test('under --exit-contract=v2 the refusal projects to the USAGE code, not DEGRADED', () => {
-      const result = runGsdTools(['state', 'add-decision', '--summary-file', outsideFile, '--exit-contract=v2'], tmpDir);
+      const result = runGsdTools(['state', 'add-decision', '--summary-file', path.join(outsideDir, 'missing.md'), '--exit-contract=v2'], tmpDir);
 
       assert.strictEqual(result.exitCode, 64);
     });
 
-    test('control: the same file content inside the project root is still accepted at exit 0', () => {
-      const insideFile = path.join(tmpDir, '.planning', 'decision.md');
-      fs.writeFileSync(insideFile, 'A throwaway entry.\n');
+    test('a relative path still resolves against the project root, not the process cwd', () => {
+      fs.writeFileSync(path.join(tmpDir, '.planning', 'decision.md'), 'Relative entry.\n');
 
-      const result = runGsdTools(['state', 'add-decision', '--phase', '3', '--summary-file', insideFile], tmpDir);
+      const result = runGsdTools(['state', 'add-decision', '--phase', '3', '--summary-file', '.planning/decision.md', '--cwd', tmpDir], outsideDir);
 
       assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
-      assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: A throwaway entry.' });
+      assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: Relative entry.' });
     });
   });
 });

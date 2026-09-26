@@ -617,37 +617,30 @@ function cmdStateGet(cwd: string, section: string | undefined, raw: boolean): vo
 
 /**
  * Resolve a text argument that may instead be supplied as a file (`--<flag>`
- * or `--<flag>-file`). The file is an input whose contents are copied into
- * STATE.md, and it must still resolve inside the project root (ADR-4650:
- * conservative about the resource).
+ * or `--<flag>-file`).
  *
- * #4926: a refused or unreadable file is a caller error, so it goes through
- * the fault path — stderr, non-zero exit (USAGE), `--json-errors` envelope —
- * rather than an `{ added: false }` payload at exit 0 that a shell caller
- * gating on `$?` reads as success while nothing was written.
+ * #4926: the file is a read-once INPUT — its contents are copied into
+ * STATE.md and the path itself is never written, recorded, or resolved
+ * again — so it is not a project-write resource and is not confined to the
+ * project root. A scratch file from an agent's temp directory is accepted.
+ * A relative path still resolves against the project root.
+ *
+ * A file that cannot be read is a caller error and goes through the fault
+ * path — stderr, non-zero exit (USAGE), `--json-errors` envelope — rather than
+ * an `{ added: false }` payload at exit 0 that a shell caller gating on `$?`
+ * reads as success while nothing was written.
  */
-function readTextArgOrFile(cwd: string, value: string | undefined, filePath: string | undefined, label: string, flag: string): string | undefined {
+function readTextArgOrFile(cwd: string, value: string | undefined, filePath: string | undefined, flag: string): string | undefined {
   if (!filePath) return value;
 
-  // Path traversal guard: ensure file resolves within project directory
-  // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/unbound-method
-  const { assertWithinRoot, PathAcceptance } = require('./security.cjs') as { assertWithinRoot(filePath: unknown, baseDir: unknown, label?: string | null, policy?: 'relative-only' | 'absolute-inside-root'): string; PathAcceptance: { RelativeOnly: 'relative-only'; AbsoluteInsideRoot: 'absolute-inside-root' } };
-  // `return error(...)`: error() throws, and returning its `never` is what lets
-  // the compiler see `contained` as definitely assigned past the catch.
-  let contained: string;
   try {
-    contained = assertWithinRoot(filePath, cwd, `${label} path`, PathAcceptance.AbsoluteInsideRoot);
+    return fs.readFileSync(path.resolve(cwd, filePath), 'utf-8').trimEnd();
   } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
     return error(
-      `${(err as Error).message} — --${flag}-file must name a file inside the project root; pass the text inline with --${flag} instead.`,
+      `--${flag}-file could not be read: ${formatDiagnosticToken(filePath)}${code ? ` (${code})` : ''}`,
       ERROR_REASON.USAGE,
     );
-  }
-
-  try {
-    return fs.readFileSync(contained, 'utf-8').trimEnd();
-  } catch {
-    return error(`${label} file not found: ${formatDiagnosticToken(filePath)}`, ERROR_REASON.USAGE);
   }
 }
 
@@ -1605,8 +1598,8 @@ function cmdStateAddDecision(cwd: string, options: StateAddDecisionOptions, raw:
   if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
 
   const { phase, summary, summary_file, rationale, rationale_file } = options;
-  const summaryText = readTextArgOrFile(cwd, summary, summary_file, 'summary', 'summary');
-  const rationaleText = readTextArgOrFile(cwd, rationale || '', rationale_file, 'rationale', 'rationale') || '';
+  const summaryText = readTextArgOrFile(cwd, summary, summary_file, 'summary');
+  const rationaleText = readTextArgOrFile(cwd, rationale || '', rationale_file, 'rationale') || '';
 
   if (!summaryText) { output({ error: 'summary required' }, raw, undefined); return; }
 
@@ -1681,7 +1674,7 @@ function cmdStateAddBlocker(cwd: string, text: string | StateAddBlockerOptions, 
   const statePath = planningPaths(cwd).state;
   if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
   const blockerOptions: StateAddBlockerOptions = typeof text === 'object' && text !== null ? text : { text: text };
-  const blockerText = readTextArgOrFile(cwd, blockerOptions.text, blockerOptions.text_file, 'blocker', 'text');
+  const blockerText = readTextArgOrFile(cwd, blockerOptions.text, blockerOptions.text_file, 'text');
 
   if (!blockerText) { output({ error: 'text required' }, raw, undefined); return; }
 
@@ -1741,7 +1734,7 @@ function cmdStateAddRoadmapEvolution(cwd: string, options: StateAddRoadmapEvolut
   if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
 
   const { phase, action, after, note, note_file, urgent } = options;
-  const noteText = readTextArgOrFile(cwd, note, note_file, 'note', 'note');
+  const noteText = readTextArgOrFile(cwd, note, note_file, 'note');
   // Reject missing / empty / whitespace-only notes — an evolution entry with no
   // narrative is meaningless and would corrupt the section with a dangling bullet.
   if (!noteText || !noteText.trim()) { output({ error: 'note required' }, raw, undefined); return; }
