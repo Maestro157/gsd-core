@@ -215,6 +215,21 @@ describe('progressStatusToken (#4967 — a Status cell is read by its leading to
       assert.equal(progressStatusToken(cell), expected);
     });
   }
+
+  test('property: prose after a leading token never changes the reading, in any letter case', () => {
+    fc.assert(
+      fc.property(
+        fc.constantFrom('Complete', 'In Progress', 'Planned', 'Not started'),
+        fc.boolean(),
+        fc.constantFrom(' — ', ' - ', ': ', ' (', ', ', ' '),
+        fc.string({ maxLength: 40 }).filter((s) => !/[\r\n|]/.test(s)),
+        (token, upper, separator, prose) => {
+          const cased = upper ? token.toUpperCase() : token.toLowerCase();
+          assert.equal(progressStatusToken(`${cased}${separator}${prose}`), token.toLowerCase());
+        },
+      ),
+    );
+  });
 });
 
 describe('clampPercent', () => {
