@@ -349,10 +349,16 @@ describe('state contract — status mapping', () => {
     assert.strictEqual(statusFor(tmpDir, 'In Progress — gap closure 1/2, see 02-VERIFICATION.md'), PHASE_STATUS.IN_PROGRESS);
   });
 
-  test('foldsUntokenedCellWithTrailingProseToPending', (t) => {
+  test('foldsDeferredWithTrailingProseToPending', (t) => {
     const tmpDir = createTempProject();
     t.after(() => cleanup(tmpDir));
     assert.strictEqual(statusFor(tmpDir, 'Deferred — pushed to v2'), PHASE_STATUS.PENDING);
+  });
+
+  test('foldsUntokenedCellWithTrailingProseToPending', (t) => {
+    const tmpDir = createTempProject();
+    t.after(() => cleanup(tmpDir));
+    assert.strictEqual(statusFor(tmpDir, 'Blocked — waiting on vendor'), PHASE_STATUS.PENDING);
   });
 
   test('doesNotReadCompletedAsTheCompleteToken', (t) => {

@@ -571,6 +571,48 @@ Some unrelated notes with no Current Position section.
     assert.equal(result.reason, 'no_current_position');
     assert.notEqual(result.verdict, 'drifted', 'a shadowed/absent Current Position must never fabricate a drift finding');
   });
+
+  // #4967: the ROADMAP cell is ranked by its leading status token, the same
+  // reading state.json and `state json` use, so operator prose kept after the
+  // token (#4925) no longer turns the comparison into `uncheckable`.
+  test('#4967: a ROADMAP cell with prose after its token is ranked by the token', () => {
+    writeState('Phase complete');
+    writeRoadmap('Complete — shipped with gate results recorded');
+    const res = runGsdTools(['drift-guard', 'phase-status', '--phase', String(PHASE)], tmpDir);
+    assert.ok(res.success, `Expected success, got: ${res.error}`);
+    const result = JSON.parse(res.output);
+    assert.equal(result.verdict, 'consistent');
+    assert.equal(result.roadmapRank, 2);
+    assert.equal(result.roadmapStatus, 'Complete — shipped with gate results recorded', 'the output reports the raw cell');
+  });
+
+  test('#4967: a real drift behind a prose-bearing ROADMAP cell is reported, not uncheckable', () => {
+    writeState('In progress');
+    writeRoadmap('Complete — shipped with gate results recorded');
+    const res = runGsdTools(['drift-guard', 'phase-status', '--phase', String(PHASE)], tmpDir);
+    assert.ok(res.success, `Expected success, got: ${res.error}`);
+    assert.equal(JSON.parse(res.output).verdict, 'drifted');
+  });
+
+  test('#4967: a prose-bearing Deferred cell keeps its declared-intent drift rule', () => {
+    writeState('In progress');
+    writeRoadmap('Deferred — pushed to v2');
+    const res = runGsdTools(['drift-guard', 'phase-status', '--phase', String(PHASE)], tmpDir);
+    assert.ok(res.success, `Expected success, got: ${res.error}`);
+    const result = JSON.parse(res.output);
+    assert.equal(result.verdict, 'drifted');
+    assert.equal(result.roadmapRank, 0);
+  });
+
+  test('#4967: a ROADMAP cell with no leading status token stays uncheckable', () => {
+    writeState('In progress');
+    writeRoadmap('Blocked — waiting on vendor');
+    const res = runGsdTools(['drift-guard', 'phase-status', '--phase', String(PHASE)], tmpDir);
+    assert.ok(res.success, `Expected success, got: ${res.error}`);
+    const result = JSON.parse(res.output);
+    assert.equal(result.verdict, 'uncheckable');
+    assert.equal(result.roadmapRank, null);
+  });
 });
 
 // ── 8. #1956/#2012 parity — findRoadmapProgressTable vs deriveProgressFromRoadmap ──

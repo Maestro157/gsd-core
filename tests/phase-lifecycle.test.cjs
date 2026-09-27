@@ -174,7 +174,7 @@ describe('deriveProgressFromRoadmap', () => {
     assert.equal(result.totalPlans, 2, `expected totalPlans 2, got ${result.totalPlans}`);
   });
 
-  test('#4967: a Complete cell with prose after the token counts as completed; an untokened cell does not', () => {
+  test('#4967: a Complete cell with prose after the token counts as completed; no other cell does', () => {
     const roadmap = [
       '## Progress',
       '',
@@ -202,9 +202,17 @@ describe('progressStatusToken (#4967 — a Status cell is read by its leading to
     ['In  progress — gap closure 1/2', 'in progress'],
     ['Planned — 3 plans', 'planned'],
     ['Not started', 'not started'],
+    ['Deferred', 'deferred'],
+    ['Deferred — pushed to v2', 'deferred'],
+    // Token boundary: limit - 1 (truncated), limit (exact, above), limit + 1.
+    ['Complet', null],
+    ['In Progres', null],
+    ['Not starte', null],
+    ['Deferre', null],
     ['Completed', null],
-    ['Deferred — pushed to v2', null],
+    ['Deferredness', null],
     ['Blocked', null],
+    ['Blocked — waiting on vendor', null],
     ['✅ Complete', null],
     ['', null],
     [undefined, null],
@@ -219,7 +227,7 @@ describe('progressStatusToken (#4967 — a Status cell is read by its leading to
   test('property: prose after a leading token never changes the reading, in any letter case', () => {
     fc.assert(
       fc.property(
-        fc.constantFrom('Complete', 'In Progress', 'Planned', 'Not started'),
+        fc.constantFrom('Complete', 'In Progress', 'Planned', 'Not started', 'Deferred'),
         fc.boolean(),
         fc.constantFrom(' — ', ' - ', ': ', ' (', ', ', ' '),
         fc.string({ maxLength: 40 }).filter((s) => !/[\r\n|]/.test(s)),

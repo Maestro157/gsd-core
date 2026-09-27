@@ -14,7 +14,7 @@
  *   - progressStatusToken(cell): a Progress-table Status cell's leading status token
  *   - clampPercent(completed, total): percent with 100 ceiling
  *
- * These two functions are the root-cause fix for issue #4.
+ * deriveProgressFromRoadmap and clampPercent are the root-cause fix for issue #4.
  *
  * References:
  *   - ADR-3524 (docs/adr/3524-cjs-sdk-hard-seam.md)
@@ -72,25 +72,28 @@ export function locateProgressTable(roadmapContent: string): MarkdownTable | nul
 /**
  * The status tokens a Progress-table Status cell leads with: the tokens
  * `roadmap update-plan-progress` and `phase complete` write, plus the roadmap
- * template's initial `Not started`. `(?!\w)` keeps `Completed` from reading as
- * `Complete`.
+ * template's `Not started | In progress | Complete | Deferred` vocabulary.
+ * `(?!\w)` keeps `Completed` from reading as `Complete`.
  */
-const PROGRESS_STATUS_TOKEN_RE = /^(not started|planned|in progress|complete)(?!\w)/i;
+const PROGRESS_STATUS_TOKEN_RE = /^(not started|planned|in progress|complete|deferred)(?!\w)/i;
 
 /** A Progress-table Status cell's leading status token, lowercased. */
-export type ProgressStatusToken = 'not started' | 'planned' | 'in progress' | 'complete';
+export type ProgressStatusToken = 'not started' | 'planned' | 'in progress' | 'complete' | 'deferred';
 
 /**
  * #4967: the single owner of "what status does this Progress-table Status cell
  * carry". The cell is classified by its LEADING status token, so operator prose
  * kept after the token (`Complete — shipped with gate results recorded`, the
  * token-vs-prose split #4925 gives the writer) does not change the reading.
- * Both readers used to demand an exact whole-cell match, so such a cell read as
- * pending and `completed_phases` / `percent` undercounted.
+ * Every reader of the cell goes through here: `deriveProgressFromRoadmap`,
+ * `state-contract`'s `statusFromProgressCell`, and the ROADMAP side of
+ * `drift-guard phase-status`. They used to demand an exact whole-cell match, so
+ * such a cell read as pending (or uncheckable) and `completed_phases` /
+ * `percent` undercounted.
  *
  * Case-insensitive, and internal whitespace is collapsed (`In  progress`). A
- * cell with no recognized leading token (`Deferred`, `Blocked`, empty) returns
- * `null`, which every caller folds to pending exactly as before.
+ * cell with no recognized leading token (`Blocked`, `✅ Complete`, empty)
+ * returns `null`, which every caller treats exactly as before.
  */
 export function progressStatusToken(cell: string | undefined): ProgressStatusToken | null {
   const m = PROGRESS_STATUS_TOKEN_RE.exec((cell ?? '').trim().replace(/\s+/g, ' '));

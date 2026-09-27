@@ -4809,8 +4809,9 @@ describe('state json counts a Progress-table Status cell by its leading token (#
     assert.deepStrictEqual(withProse, progressFor('Complete'));
   });
 
-  test('a cell with no leading status token is still not counted', () => {
+  test('a Deferred cell, or one with no leading status token, is still not counted', () => {
     assert.strictEqual(progressFor('Deferred — pushed to v2').completed_phases, 0);
+    assert.strictEqual(progressFor('Blocked — waiting on vendor').completed_phases, 0);
   });
 });
 

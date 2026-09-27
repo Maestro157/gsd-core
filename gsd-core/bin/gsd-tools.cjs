@@ -4390,6 +4390,7 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
             const { planningDir } = require('./lib/planning-workspace.cjs');
             const { stateExtractField, stateCurrentPositionSlice } = require('./lib/state-document.cjs');
             const { findRoadmapProgressTable } = require('./lib/roadmap-parser.cjs');
+            const { progressStatusToken } = require('./lib/phase-lifecycle.cjs');
             const { phaseKeyFromProse } = require('./lib/phase-id.cjs');
             // STATE.md's YAML frontmatter carries its own lowercase `status:`
             // scalar ahead of the body's `## Current Position` prose "Status:"
@@ -4509,8 +4510,15 @@ function dispatchOverlayCapabilityCommand({ command, args, cwd, raw, error, load
               return;
             }
 
+            // #4967: rank the ROADMAP cell by its leading status token (the
+            // one reader of this cell), so `Complete — shipped …` compares as
+            // Complete instead of uncheckable. A cell with no token is passed
+            // through as before; the output keeps the raw cell.
             const roadmapStatus = matchedRow.Status;
-            const result = comparePhaseStatus({ stateStatus, roadmapStatus });
+            const result = comparePhaseStatus({
+              stateStatus,
+              roadmapStatus: progressStatusToken(roadmapStatus) ?? roadmapStatus,
+            });
             output({
               verdict: result.verdict,
               phase,
