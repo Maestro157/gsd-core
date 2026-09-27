@@ -1595,13 +1595,15 @@ function cmdStateUpdateProgress(cwd: string, raw: boolean): void {
 
 function cmdStateAddDecision(cwd: string, options: StateAddDecisionOptions, raw: boolean): void {
   const statePath = planningPaths(cwd).state;
-  if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
+  // #4926: every refusal from this verb goes through the fault path (non-zero
+  // exit), so a caller gating on `$?` never reads success while nothing was written.
+  if (!fs.existsSync(statePath)) return error('STATE.md not found', ERROR_REASON.USAGE);
 
   const { phase, summary, summary_file, rationale, rationale_file } = options;
   const summaryText = readTextArgOrFile(cwd, summary, summary_file, 'summary');
   const rationaleText = readTextArgOrFile(cwd, rationale || '', rationale_file, 'rationale') || '';
 
-  if (!summaryText) { output({ error: 'summary required' }, raw, undefined); return; }
+  if (!summaryText) return error('summary required — pass --summary, or a non-empty --summary-file', ERROR_REASON.USAGE);
 
   // #3231/#3481: `--phase` omitted → resolve from the STATE.md being written, via
   // the canonical ladder `state prune` uses. A decision entry is a permanent
@@ -1672,11 +1674,13 @@ function cmdStateAddDecision(cwd: string, options: StateAddDecisionOptions, raw:
 
 function cmdStateAddBlocker(cwd: string, text: string | StateAddBlockerOptions, raw: boolean): void {
   const statePath = planningPaths(cwd).state;
-  if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
+  // #4926: every refusal from this verb goes through the fault path (non-zero
+  // exit), so a caller gating on `$?` never reads success while nothing was written.
+  if (!fs.existsSync(statePath)) return error('STATE.md not found', ERROR_REASON.USAGE);
   const blockerOptions: StateAddBlockerOptions = typeof text === 'object' && text !== null ? text : { text: text };
   const blockerText = readTextArgOrFile(cwd, blockerOptions.text, blockerOptions.text_file, 'text');
 
-  if (!blockerText) { output({ error: 'text required' }, raw, undefined); return; }
+  if (!blockerText) return error('text required — pass --text, or a non-empty --text-file', ERROR_REASON.USAGE);
 
   const entry = `- ${blockerText}`;
   let _added = false;
@@ -1731,13 +1735,15 @@ function cmdStateAddBlocker(cwd: string, text: string | StateAddBlockerOptions, 
 
 function cmdStateAddRoadmapEvolution(cwd: string, options: StateAddRoadmapEvolutionOptions, raw: boolean): void {
   const statePath = planningPaths(cwd).state;
-  if (!fs.existsSync(statePath)) { output({ error: 'STATE.md not found' }, raw, undefined); return; }
+  // #4926: every refusal from this verb goes through the fault path (non-zero
+  // exit), so a caller gating on `$?` never reads success while nothing was written.
+  if (!fs.existsSync(statePath)) return error('STATE.md not found', ERROR_REASON.USAGE);
 
   const { phase, action, after, note, note_file, urgent } = options;
   const noteText = readTextArgOrFile(cwd, note, note_file, 'note');
   // Reject missing / empty / whitespace-only notes — an evolution entry with no
   // narrative is meaningless and would corrupt the section with a dangling bullet.
-  if (!noteText || !noteText.trim()) { output({ error: 'note required' }, raw, undefined); return; }
+  if (!noteText || !noteText.trim()) return error('note required — pass --note, or a non-empty --note-file', ERROR_REASON.USAGE);
   // Flatten line breaks so the entry is always a single Markdown bullet. The
   // dedupe + rendering contract is line-oriented; a multiline --note-file would
   // otherwise spill continuation lines outside the bullet and defeat dedupe.

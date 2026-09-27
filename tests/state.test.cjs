@@ -701,10 +701,12 @@ None
   });
 
   // #4926: the text-file flags take a read-once INPUT, so a readable file
-  // anywhere is accepted (it used to be confined to the project root), and an
-  // unreadable one is refused through the fault path — it used to be
-  // `{ added: false }` at exit 0, which a caller gating on `$?` read as success.
-  describe('#4926 text-file inputs: any readable file is accepted; an unreadable one exits non-zero', () => {
+  // anywhere is accepted (it used to be confined to the project root). Every
+  // refusal from these three verbs goes through the fault path: an unreadable
+  // file, a blank required field, a missing STATE.md. They used to print
+  // `{ added: false }` or `{ error }` at exit 0, which a caller gating on `$?`
+  // read as success.
+  describe('#4926 text-file inputs: any readable file is accepted; every refusal exits non-zero', () => {
     let outsideDir;
     const stateBody = `# Project State
 
@@ -774,6 +776,76 @@ None
         assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
       });
     }
+
+    // A readable but empty (or whitespace-only) file leaves a required field with
+    // no text. That refusal used to be `{ error: '<field> required' }` at exit 0.
+    const requiredFlags = [
+      { flag: '--summary-file', field: 'summary', argv: (f) => ['state', 'add-decision', '--phase', '3', '--summary-file', f] },
+      { flag: '--text-file', field: 'text', argv: (f) => ['state', 'add-blocker', '--text-file', f] },
+      { flag: '--note-file', field: 'note', argv: (f) => ['state', 'add-roadmap-evolution', '--phase', '3', '--note-file', f] },
+    ];
+    const blankContents = [
+      { name: 'an empty file', content: '' },
+      { name: 'a whitespace-only file', content: '  \n\t\n' },
+    ];
+
+    for (const r of requiredFlags) {
+      for (const blank of blankContents) {
+        test(`${r.flag} naming ${blank.name} exits 1 with reason usage and leaves STATE.md untouched`, () => {
+          const file = path.join(outsideDir, 'blank.md');
+          fs.writeFileSync(file, blank.content);
+
+          const result = runGsdTools([...r.argv(file), '--json-errors'], tmpDir);
+
+          assert.strictEqual(result.exitCode, 1, `refusal must exit non-zero; stdout: ${result.output}`);
+          const envelope = JSON.parse(result.error);
+          assert.strictEqual(envelope.reason, ERROR_REASON.USAGE);
+          assert.ok(envelope.message.startsWith(`${r.field} required`), `got: ${envelope.message}`);
+          assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
+        });
+      }
+    }
+
+    // The rationale is optional: an empty --rationale-file means "no rationale",
+    // exactly as `--rationale ""` does, so the decision is still written.
+    test('an empty --rationale-file is not a refusal: the decision is written without a rationale', () => {
+      const file = path.join(outsideDir, 'rationale.md');
+      fs.writeFileSync(file, '');
+
+      const result = runGsdTools(['state', 'add-decision', '--phase', '3', '--summary', 'Chosen', '--rationale-file', file], tmpDir);
+
+      assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
+      assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: Chosen' });
+    });
+
+    const verbs = [
+      { name: 'add-decision', argv: ['state', 'add-decision', '--phase', '3', '--summary', 'Chosen'] },
+      { name: 'add-blocker', argv: ['state', 'add-blocker', '--text', 'Blocked'] },
+      { name: 'add-roadmap-evolution', argv: ['state', 'add-roadmap-evolution', '--phase', '3', '--note', 'Moved'] },
+    ];
+
+    for (const v of verbs) {
+      test(`${v.name} with no STATE.md exits 1 with reason usage and creates nothing`, () => {
+        cleanup(statePath());
+
+        const result = runGsdTools([...v.argv, '--json-errors'], tmpDir);
+
+        assert.strictEqual(result.exitCode, 1, `refusal must exit non-zero; stdout: ${result.output}`);
+        const envelope = JSON.parse(result.error);
+        assert.strictEqual(envelope.reason, ERROR_REASON.USAGE);
+        assert.strictEqual(envelope.message, 'STATE.md not found');
+        assert.strictEqual(fs.existsSync(statePath()), false, 'no STATE.md may be created by a refusal');
+      });
+    }
+
+    test('under --exit-contract=v2 a blank required file and a missing STATE.md also project to the USAGE code', () => {
+      const file = path.join(outsideDir, 'blank.md');
+      fs.writeFileSync(file, '');
+      assert.strictEqual(runGsdTools(['state', 'add-blocker', '--text-file', file, '--exit-contract=v2'], tmpDir).exitCode, 64);
+
+      cleanup(statePath());
+      assert.strictEqual(runGsdTools(['state', 'add-blocker', '--text', 'Blocked', '--exit-contract=v2'], tmpDir).exitCode, 64);
+    });
 
     test('a directory passed as --summary-file is refused the same way', () => {
       const result = runGsdTools(['state', 'add-decision', '--summary-file', outsideDir, '--json-errors'], tmpDir);

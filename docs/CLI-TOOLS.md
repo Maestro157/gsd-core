@@ -111,8 +111,11 @@ node gsd-tools.cjs state add-decision --summary-file path [--rationale-file path
 # Text-file inputs (--summary-file, --rationale-file, --text-file, --note-file) are
 # read once and copied into STATE.md, so any readable file is accepted, including one
 # in a temp/scratch directory outside the project; a relative path resolves against
-# the project root. A file that cannot be read is refused on stderr with a non-zero
-# exit (reason "usage") and STATE.md is not touched.
+# the project root. A file that cannot be read, a required field left empty (an empty
+# or whitespace-only --summary-file, --text-file or --note-file), or a missing STATE.md
+# is refused on stderr with a non-zero exit (reason "usage") and STATE.md is not
+# touched. An empty --rationale-file just means no rationale, like --rationale "".
+# (add-decision, add-blocker and add-roadmap-evolution only.)
 
 # Add/resolve blockers
 node gsd-tools.cjs state add-blocker --text "..."
