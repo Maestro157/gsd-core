@@ -1937,6 +1937,36 @@ describe('#4925: roadmap update-plan-progress — Status-cell prose and the Comp
     assert.strictEqual(fs.readFileSync(roadmapPath, 'utf-8'), expected);
   });
 
+  test('a Deferred cell is an operator decision and is left untouched, prose included', () => {
+    const roadmap = progressRoadmap('| 68. Scheduler | v1.3 | 0/5 | Deferred — pushed to v1.4 | - |');
+    seedPhase68WithPlans(tmpDir, { roadmap });
+
+    const result = runGsdTools('roadmap update-plan-progress 68', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const expected = roadmap.replace(
+      '| 68. Scheduler | v1.3 | 0/5 | Deferred — pushed to v1.4 | - |',
+      '| 68. Scheduler | v1.3 | 1/5 | Deferred — pushed to v1.4 | - |',
+    );
+    assert.strictEqual(fs.readFileSync(roadmapPath, 'utf-8'), expected);
+  });
+
+  // #4967: the writer reads the token through the same owner as every reader,
+  // so a cell they read as `in progress` is one it can advance.
+  test('#4967: a two-word token with extra internal whitespace is recognized, rewritten, and its prose kept', () => {
+    const roadmap = progressRoadmap('| 68. Scheduler | v1.3 | 0/5 | Not  started — waiting on crate decision | - |');
+    seedPhase68WithPlans(tmpDir, { roadmap });
+
+    const result = runGsdTools('roadmap update-plan-progress 68', tmpDir);
+    assert.ok(result.success, `Command failed: ${result.error}`);
+
+    const expected = roadmap.replace(
+      '| 68. Scheduler | v1.3 | 0/5 | Not  started — waiting on crate decision | - |',
+      '| 68. Scheduler | v1.3 | 1/5 | In Progress — waiting on crate decision | - |',
+    );
+    assert.strictEqual(fs.readFileSync(roadmapPath, 'utf-8'), expected);
+  });
+
   test('a bare status token still transitions, written with the same padding phase complete uses', () => {
     const roadmap = progressRoadmap('| 68. Scheduler | v1.3 | 0/5 | Not started | - |');
     seedPhase68WithPlans(tmpDir, { roadmap });

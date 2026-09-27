@@ -4,7 +4,7 @@
  * Behavioral tests for phase-lifecycle.cjs
  *
  * Module: gsd-core/bin/lib/phase-lifecycle.cjs
- * Exports: deriveProgressFromRoadmap, progressStatusToken, clampPercent, progressBarFilledCells, renderProgressBar
+ * Exports: deriveProgressFromRoadmap, matchProgressStatusToken, progressStatusToken, clampPercent, progressBarFilledCells, renderProgressBar
  *
  * ADR-2143 (epic #2143) migrated deriveProgressFromRoadmap from position-based
  * regexes to the markdown-table schema registry (collectSection + parseMarkdownTable
@@ -23,6 +23,7 @@ const assert = require('node:assert/strict');
 
 const {
   deriveProgressFromRoadmap,
+  matchProgressStatusToken,
   progressStatusToken,
   clampPercent,
   progressBarFilledCells,
@@ -223,6 +224,13 @@ describe('progressStatusToken (#4967 — a Status cell is read by its leading to
       assert.equal(progressStatusToken(cell), expected);
     });
   }
+
+  test('matchProgressStatusToken reports the token as written, so a writer can replace exactly that span', () => {
+    assert.deepEqual(matchProgressStatusToken('  In  progress — gap closure 1/2 '), { token: 'in progress', text: 'In  progress' });
+    assert.deepEqual(matchProgressStatusToken('COMPLETE (verified)'), { token: 'complete', text: 'COMPLETE' });
+    assert.equal(matchProgressStatusToken('Blocked — waiting on vendor'), null);
+    assert.equal(matchProgressStatusToken(undefined), null);
+  });
 
   test('property: prose after a leading token never changes the reading, in any letter case', () => {
     fc.assert(

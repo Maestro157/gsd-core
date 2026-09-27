@@ -29,7 +29,7 @@ import roadmapParserModule = require('./roadmap-parser.cjs');
 const { stripShippedMilestones, extractCurrentMilestone, extractCurrentMilestoneScoped, replaceInCurrentMilestone, listMilestoneHeadings, scanMilestonePhaseIds, collectTablePhaseRows, hasPhaseListingTableHeader } = roadmapParserModule;
 import { tokenizeHeadings } from './markdown-sectionizer.cjs';
 import { escapeCell, updateTableCell } from './markdown-table.cjs';
-import { clampPercent } from './phase-lifecycle.cjs';
+import { clampPercent, matchProgressStatusToken } from './phase-lifecycle.cjs';
 import { platformWriteSync } from './shell-command-projection.cjs';
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 import planningWorkspace = require('./planning-workspace.cjs');
@@ -1219,9 +1219,6 @@ function cmdRoadmapUpdatePlanProgress(cwd: string, phaseNum: string | null | und
     const phaseCellRe = new RegExp(`^${phasePattern}\\.?(?:\\s|$)`, 'i');
     const rowMatch = (row: Record<string, string>): boolean => phaseCellRe.test((row['Phase'] ?? '').trim());
     const dateShape = /^\d{4}-\d{2}-\d{2}$/;
-    // The status tokens this verb and the roadmap template write into the
-    // Status cell (`Not started` is the template's initial value).
-    const statusTokenRe = /^(?:not started|planned|in progress|complete)(?!\w)/i;
 
     roadmapContent = editProgressTableSlice(roadmapContent, (scoped) => {
       let text = scoped;
@@ -1237,12 +1234,15 @@ function cmdRoadmapUpdatePlanProgress(cwd: string, phaseNum: string | null | und
       //      phase complete writes ` Complete    ` (phase.cts).
       //   2. a leading status token → rewrite the token only and keep the prose
       //      after it; an unchanged token leaves the cell byte-identical.
-      //   3. freeform prose with no leading token → operator-owned, untouched.
+      //   3. freeform prose with no leading token, or a `Deferred` cell (an
+      //      operator decision, not a state this verb derives) → untouched.
+      // #4967: the token is read by phase-lifecycle's matchProgressStatusToken,
+      // the one owner of the Status-cell vocabulary every reader also uses.
       const statusResult = updateTableCell(text, rowMatch, 'Status', (current) => {
         if (current === '' || /^[-–—]$/.test(current)) return ` ${status.padEnd(11)} `;
-        const token = statusTokenRe.exec(current);
-        if (!token || token[0] === status) return current;
-        const rest = current.slice(token[0].length);
+        const token = matchProgressStatusToken(current);
+        if (!token || token.token === 'deferred' || token.text === status) return current;
+        const rest = current.slice(token.text.length);
         return rest === '' ? ` ${status.padEnd(11)} ` : ` ${escapeCell(status + rest)} `;
       });
       if (statusResult.ok) { text = statusResult.value; tableRowFound = true; }
