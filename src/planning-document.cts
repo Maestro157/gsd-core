@@ -12,7 +12,10 @@
  *
  * This phase migrates NO call site — it is purely additive (ADR-4910 §7).
  * Only `boldField` nodes are writable; `table`/`checklist` nodes parse and
- * read only (their writers are Phase 3's escaping work).
+ * read only. Phase 3 (#4958) checked its own evidence (#4736, #4793) and
+ * found neither needed a table/checklist writer here — see ADR-4910's
+ * 2026-09-24 amendment. A writer for either kind is unclaimed until a real
+ * call site names it.
  *
  * Hyrum's Law commitment (row 3 of the design's behaviour table): `serialize`
  * with zero staged edits returns `doc.source` BYTE-IDENTICAL — never a
@@ -31,7 +34,7 @@ import { isCanonicalPlanningFile, CANONICAL_EXACT } from './artifacts.cjs';
 import frontmatterModule from './frontmatter.cjs';
 import type { Result } from './write-set.cjs';
 
-const { frontmatterRegion } = frontmatterModule;
+const { frontmatterRegion, extractFrontmatter, FRONTMATTER_UNPARSEABLE } = frontmatterModule;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -111,7 +114,25 @@ export interface PlanningDoc {
   readonly staged: ReadonlyMap<NodeId, string>;
 }
 
-export type NodeRead = { ok: true; value: string } | { ok: false; reason: string; span: Span };
+/**
+ * Generic over the success `value` shape. Defaults to `string` — every
+ * pre-existing caller (`readNode`, always a `boldField`/section/table/
+ * checklist span's own text) is unaffected by this widening. #5026's
+ * `readFrontmatterField` is the first caller to need a non-string value
+ * (`frontmatter.cts`'s `FrontmatterValue`: a scalar string, a string array,
+ * or a nested object) and instantiates the parameter explicitly.
+ */
+export type NodeRead<T = string> = { ok: true; value: T } | { ok: false; reason: string; span: Span };
+
+/**
+ * The value shapes `frontmatter.cts`'s `extractFrontmatter` can produce for a
+ * single top-level key: a scalar string, a string array, or (rarely) a
+ * still-nested object. Mirrors that module's own internal `FrontmatterValue`
+ * type structurally — `frontmatter.cts` uses `export =` with no exported
+ * named type, so this is redeclared rather than imported (TS structural
+ * typing makes the two interchangeable at the call site).
+ */
+export type FrontmatterFieldValue = string | string[] | Record<string, unknown>;
 
 export type SerializeOutcome =
   | { ok: true; value: string }
@@ -229,7 +250,15 @@ function fencedLineIndices(lines: LineInfo[]): Set<number> {
   return set;
 }
 
-const BOLD_FIELD_RE = /^(\s*)(\*\*[^*\r\n]+:\*\*)([ \t]*)([^\r\n]*)$/;
+/** Matches both shipped bold-field spellings: colon-inside (`**Label:**`,
+ * the original grammar) and colon-outside (`**Label**:`, the canonical form
+ * used throughout `templates/roadmap.md`). Each alternative's trailing
+ * marker is exactly 3 characters (`:**` or `**:`), so `token.slice(2, -3)`
+ * in `parseBoldFieldLine` strips the leading `**` and the spelling-specific
+ * trailing marker identically for both, yielding the same `label` either
+ * way. Deliberately excludes a bare unbolded `Label:` form — see Phase 1's
+ * prose-vs-field disambiguation design. */
+const BOLD_FIELD_RE = /^(\s*)(\*\*[^*\r\n]+(?::\*\*|\*\*:))([ \t]*)([^\r\n]*)$/;
 /** Boundary marking a hand-written trailing annotation on a field line —
  * the token owner must never destroy prose past this separator. */
 const TRAILING_SEPARATOR_RE = / — /;
@@ -416,7 +445,10 @@ export function parsePlanningDoc(source: string, artifact: string): Result<Plann
   }
 
   if (source.length === 0) {
-    return { ok: true, value: { source, artifact, nodes: [], staged: new Map() } };
+    return {
+      ok: true,
+      value: { source, artifact, nodes: [], staged: new Map() },
+    };
   }
 
   const lines = splitLinesInfo(source);
@@ -443,7 +475,10 @@ export function parsePlanningDoc(source: string, artifact: string): Result<Plann
 
   nodes.sort((a, b) => a.span.start - b.span.start);
 
-  return { ok: true, value: { source, artifact, nodes, staged: new Map() } };
+  return {
+    ok: true,
+    value: { source, artifact, nodes, staged: new Map() },
+  };
 }
 
 /** Find the id of the (first, document-order) `boldField` node whose label
@@ -472,10 +507,217 @@ export function readNode(doc: PlanningDoc, id: NodeId): NodeRead {
 }
 
 /**
+ * Parse a frontmatter block's own span TEXT (fences included) via
+ * `frontmatter.cts`'s `extractFrontmatter`, exactly ONCE, returning either the
+ * parsed object or a `{ ok: false }` marker for the `FRONTMATTER_UNPARSEABLE`
+ * case. Split out of the single-key lookup below (#5026 follow-up) so a
+ * caller reading MULTIPLE keys off the SAME region
+ * (`readFrontmatterFieldsFromSource`) detects the span and parses its YAML
+ * once, not once per key — this function is the one and only place that
+ * detect-then-parse step happens; every reader (single-key or bulk) composes
+ * it rather than re-deriving it.
+ */
+function parseFrontmatterRegion(
+  regionText: string,
+): { ok: true; value: Record<string, FrontmatterFieldValue> } | { ok: false } {
+  const fm = extractFrontmatter(regionText);
+  if ((fm as unknown as Record<symbol, unknown>)[FRONTMATTER_UNPARSEABLE] === true) {
+    return { ok: false };
+  }
+  return { ok: true, value: fm };
+}
+
+/**
+ * Shared core of `readFrontmatterField` / `readFrontmatterFieldFromSource` /
+ * `readFrontmatterFieldsFromSource`: given an ALREADY-PARSED frontmatter
+ * result (`parseFrontmatterRegion`'s output) and the `Span` to report on
+ * failure, shape one `key`'s lookup as a `NodeRead`. Every reader composes
+ * this SAME shaping step — neither may duplicate it (the exact
+ * `DEFECT.GENERATIVE-FIX` class this epic exists to close).
+ *
+ * A region that failed to parse as YAML (`extractFrontmatter` reports this by
+ * returning `{}` carrying the `FRONTMATTER_UNPARSEABLE` Symbol, per that
+ * module's own documented contract) → `{ ok: false, reason:
+ * 'unparseable-frontmatter', span }`. A parseable region whose key is simply
+ * absent → `{ ok: false, reason: 'field-not-found', span }` —
+ * `extractFrontmatter` itself has no notion of "field not found" (a missing
+ * key just reads `undefined` off its returned object), so this reason string
+ * is this seam's own, not a passthrough of an upstream contract.
+ */
+function shapeFrontmatterField(
+  parsed: { ok: true; value: Record<string, FrontmatterFieldValue> } | { ok: false },
+  span: Span,
+  key: string,
+): NodeRead<FrontmatterFieldValue> {
+  if (!parsed.ok) {
+    return { ok: false, reason: 'unparseable-frontmatter', span };
+  }
+  const value = parsed.value[key];
+  if (value === undefined) {
+    return { ok: false, reason: 'field-not-found', span };
+  }
+  return { ok: true, value };
+}
+
+/** Single-key lookup: parse `regionText` once (`parseFrontmatterRegion`) and
+ * shape `key`'s result (`shapeFrontmatterField`). Used by `readFrontmatterField`
+ * and `readFrontmatterFieldFromSource`, which each already have the region's
+ * own text and span in hand; a caller reading several keys off one region
+ * should use `readFrontmatterFieldsFromSource` instead, to avoid re-parsing
+ * once per key. */
+function lookupFrontmatterField(regionText: string, span: Span, key: string): NodeRead<FrontmatterFieldValue> {
+  return shapeFrontmatterField(parseFrontmatterRegion(regionText), span, key);
+}
+
+/**
+ * Read one top-level frontmatter key off an already-parsed `PlanningDoc`,
+ * composing `frontmatter.cts`'s `extractFrontmatter` rather than
+ * reimplementing YAML parsing (ADR-4910 Decision 1's precedent — the same
+ * composition `frontmatterRegion` already uses).
+ *
+ * No `FrontmatterNode` in `doc.nodes` (there is at most one per document) →
+ * `{ ok: false, reason: 'no-frontmatter', span: {0,0} }`, mirroring
+ * `findField`'s own not-found span convention (`readNode`'s unknown-id case).
+ *
+ * A `FrontmatterNode` is only ever pushed onto `doc.nodes` when its fence was
+ * terminated (`parsePlanningDoc` fails the whole document, before any node
+ * exists, on an unterminated fence) — so the "opened but never closed" case
+ * `extractFrontmatter` also handles is never reachable from an already-parsed
+ * `PlanningDoc` through this function. See `lookupFrontmatterField` for the
+ * unparseable-frontmatter / field-not-found / present result shapes.
+ */
+export function readFrontmatterField(doc: PlanningDoc, key: string): NodeRead<FrontmatterFieldValue> {
+  const node = doc.nodes.find((n): n is FrontmatterNode => n.kind === 'frontmatter');
+  if (!node) {
+    return { ok: false, reason: 'no-frontmatter', span: { start: 0, end: 0 } };
+  }
+  const raw = doc.source.slice(node.span.start, node.span.end);
+  return lookupFrontmatterField(raw, node.span, key);
+}
+
+/**
+ * Read one top-level frontmatter key directly off raw `source` text, with no
+ * `PlanningDoc`/artifact-kind gate involved (#5026). `parsePlanningDoc`'s
+ * artifact-kind gate exists to distinguish "this document records nothing"
+ * from "wrong kind entirely" for a caller that might hand it any
+ * `.planning/`-root file, including a non-markdown one (config.json,
+ * state.json, …) — a risk that does not exist for a caller (`plan-document.
+ * cts`) that is ONLY ever invoked on real `*-PLAN.md` content, never on
+ * anything else, and is never given a canonical root-artifact basename to
+ * gate on in the first place (`*-PLAN.md` lives nested under
+ * `.planning/phase/*\/plans/`, never at the `.planning/` root
+ * `PLANNING_ARTIFACTS` enumerates — confirmed by execution:
+ * `isCanonicalPlanningFile('01-PLAN.md')` is `false`). This entry point
+ * routes around that gate rather than through it, for exactly that caller
+ * shape: content in hand, no filename to check, no need for any other
+ * `PlanningDoc` capability (sections/tables/checklists) this seam offers.
+ *
+ * Locates the frontmatter span via `findFrontmatterSpan` — the SAME
+ * `frontmatterRegion`-composing helper `parsePlanningDoc` itself uses to
+ * build a `FrontmatterNode` — so this is not a second detection mechanism,
+ * only a bypass of the node-parsing pipeline neither this caller nor its
+ * content needs.
+ *
+ * No frontmatter fence at byte 0 at all → `{ ok: false, reason:
+ * 'no-frontmatter', span: {0,0} }`, the same shape `readFrontmatterField`
+ * returns for its own not-found case. An OPENED-but-never-closed fence is
+ * reachable here (unlike `readFrontmatterField`, which can only ever see an
+ * already-terminated frontmatter node): `extractFrontmatter` treats that
+ * region as if it had none (`{}`, no `FRONTMATTER_UNPARSEABLE` marker), so
+ * every key on it comes back `field-not-found` — matching exactly what a
+ * direct `extractFrontmatter(source)[key] === undefined` check already
+ * produces for that same input today. See `lookupFrontmatterField` for the
+ * unparseable-frontmatter / field-not-found / present result shapes.
+ */
+export function readFrontmatterFieldFromSource(source: string, key: string): NodeRead<FrontmatterFieldValue> {
+  const found = findFrontmatterSpan(source);
+  if (!found) {
+    return { ok: false, reason: 'no-frontmatter', span: { start: 0, end: 0 } };
+  }
+  const raw = source.slice(found.span.start, found.span.end);
+  return lookupFrontmatterField(raw, found.span, key);
+}
+
+/**
+ * Read MULTIPLE top-level frontmatter keys off raw `source` text in ONE pass
+ * — the bulk sibling of `readFrontmatterFieldFromSource`, for a caller (added
+ * for `plan-document.cts`'s `parsePlanDocument`, #5026 follow-up) that needs
+ * several keys off the SAME document. Calling `readFrontmatterFieldFromSource`
+ * once per key each independently re-detects the frontmatter span AND
+ * re-parses the full frontmatter YAML from scratch (`findFrontmatterSpan` +
+ * `parseFrontmatterRegion`, both non-trivial scans) — this function detects
+ * the span and parses the YAML exactly ONCE, then shapes every requested key
+ * off that SAME parsed result.
+ *
+ * This is a second ENTRY POINT into the one shared detect-span +
+ * parse-YAML + shape-a-key pipeline (`findFrontmatterSpan` /
+ * `parseFrontmatterRegion` / `shapeFrontmatterField`), never a second parser:
+ * per-key result shapes are byte-identical to calling
+ * `readFrontmatterFieldFromSource` once per key (same `no-frontmatter` /
+ * `unparseable-frontmatter` / `field-not-found` / present shapes, same span).
+ */
+export function readFrontmatterFieldsFromSource(
+  source: string,
+  keys: readonly string[],
+): Record<string, NodeRead<FrontmatterFieldValue>> {
+  const found = findFrontmatterSpan(source);
+  const out: Record<string, NodeRead<FrontmatterFieldValue>> = {};
+
+  if (!found) {
+    const span: Span = { start: 0, end: 0 };
+    for (const key of keys) out[key] = { ok: false, reason: 'no-frontmatter', span };
+    return out;
+  }
+
+  const raw = source.slice(found.span.start, found.span.end);
+  const parsed = parseFrontmatterRegion(raw);
+  for (const key of keys) out[key] = shapeFrontmatterField(parsed, found.span, key);
+  return out;
+}
+
+/**
  * Stage a new value for a `boldField` node, returning a NEW `PlanningDoc`
  * (immutable — `doc` itself is never mutated). Refuses an id this doc did
- * not mint, and refuses any node kind other than `boldField` — only the
+ * not mint, and refuses any node kind other than `boldField` — only
  * `valueSpan` is ever writable this phase (ADR-4910 §1).
+ *
+ * #5007 / ADR-4910 Phase 6: a prior amendment here added a `{ allowSeparator:
+ * true }` escape hatch that spliced the caller's value across the FULL
+ * rest-of-line span (`valueSpan.start`..`trailingSpan.end`) to let a value
+ * legitimately containing the grammar's ` — ` trailing-separator token
+ * (`TRAILING_SEPARATOR_RE`) be written without triggering the round-trip
+ * refusal below. That option was REMOVED (still #5007, same phase) after a
+ * failing-first reproduction proved it only avoided the refusal AT WRITE
+ * TIME: the written bytes are correct, but `parseBoldFieldLine` splits on
+ * ` — ` unconditionally and without any escaping/metadata to distinguish
+ * "atomic value containing the token" from "value plus hand-annotation" —
+ * the same input shape either way. So the NEXT fresh `parsePlanningDoc` of
+ * that exact text (not the in-memory `doc` the option's own tests checked)
+ * silently re-truncates the value and demotes the rest to `trailingSpan`,
+ * with `findField`/`readNode` reporting a confident, wrong `ok: true`
+ * result and no error — reproduced live: staging `"Phase — COMPLETE"` this
+ * way, serializing, and re-parsing the output through a fresh
+ * `parsePlanningDoc` read back `"Phase"` via `readNode`, silently losing
+ * ` — COMPLETE`. This is exactly the #4917 finding-2 corruption this
+ * module's round-trip check exists to prevent, just moved one parse cycle
+ * downstream of where the check could still catch it. There is no escaping
+ * convention anywhere in this grammar (`BOLD_FIELD_RE`/`TRAILING_SEPARATOR_
+ * RE` are unconditional, unversioned regexes with no metadata channel), and
+ * `TRAILING_SEPARATOR_RE`'s split is relied on by every other reader of this
+ * seam (`findField`/`readNode`, used today for ROADMAP.md's `Plans`/
+ * `Depends on` fields) — narrowing or version-gating it here would be a
+ * grammar change with its own blast radius, not a local bug fix. Widening
+ * `setFieldValue`'s PUBLIC, shared contract to include a write path that is
+ * only safe for a caller who never reads the field back through this same
+ * module is an attractive nuisance: nothing stops a future `findField`/
+ * `readNode` caller from reaching for it and hitting this exact corruption.
+ * The one real caller (`stateReplaceField`, src/state-document.cts) never
+ * reads STATE.md fields back through `parsePlanningDoc`/`findField` (it uses
+ * `stateExtractField`'s own non-splitting regex instead), so it does its own
+ * local full-rest-of-line splice directly against `content`, using this
+ * module only to LOCATE the field's spans — keeping the dangerous affordance
+ * out of this shared seam's public surface entirely, rather than fixing it
+ * with a narrower version of the same false-safety option.
  */
 export function setFieldValue(doc: PlanningDoc, id: NodeId, value: string): Result<PlanningDoc> {
   const node = doc.nodes.find((n) => n.id === id);
@@ -494,6 +736,7 @@ export function setFieldValue(doc: PlanningDoc, id: NodeId, value: string): Resu
   if (/[\r\n]/.test(value)) {
     return { ok: false, reason: 'field value must not contain a line break (\\r or \\n)' };
   }
+
   // #4917 / ADR-4910 Decision 4: "a value that cannot be represented in the
   // grammar is refused by the writer, with a report." This is a GENERAL
   // round-trip representability check, not a blacklist of forbidden
@@ -523,7 +766,10 @@ export function setFieldValue(doc: PlanningDoc, id: NodeId, value: string): Resu
   }
   const staged = new Map(doc.staged);
   staged.set(id, value);
-  return { ok: true, value: { source: doc.source, artifact: doc.artifact, nodes: doc.nodes, staged } };
+  return {
+    ok: true,
+    value: { source: doc.source, artifact: doc.artifact, nodes: doc.nodes, staged },
+  };
 }
 
 /** True when any node in `doc` failed to parse. */

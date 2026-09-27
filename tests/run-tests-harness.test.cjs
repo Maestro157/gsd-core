@@ -439,6 +439,39 @@ test('ambient GSD workstream vars are stripped by the runner', () => {
       );
     });
 
+    test('the unmeasured-file cap has no effect when no timings table loads at all', () => {
+      // Same 7-file seed and file-count-chunking env as the sibling test above,
+      // but with RUN_TESTS_MAX_UNMEASURED_PER_CHUNK set to 1 — lower than any
+      // chunk's file count under plain {3,2,2} file-count chunking. If the
+      // unmeasured cap wrongly applied when no table loads (main() deriving it
+      // unconditionally instead of gating on loadedTimings()), a cap of 1 would
+      // force 7 single-file chunks instead of 3. Proves the cap genuinely has
+      // NO effect in the no-table case, not just that it happens not to bind.
+      const names = Array.from({ length: 7 }, (_, i) => `tiny-${String(i).padStart(2, '0')}.test.cjs`);
+      seed(tmpDir, names);
+      const r = runHarness(tmpDir, [], {
+        RUN_TESTS_MAX_CMDLINE_CHARS: '100000',
+        RUN_TESTS_MAX_FILES_PER_CHUNK: '3',
+        RUN_TESTS_MAX_UNMEASURED_PER_CHUNK: '1',
+        RUN_TESTS_TIMINGS_FILE: path.join(tmpDir, 'no-such-timings-4434.json'),
+      });
+      assert.strictEqual(
+        r.status,
+        0,
+        `expected zero exit; got status=${r.status} signal=${r.signal}\nSTDERR:\n${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /run-tests: chunk 1\/3 — 3 files/,
+        `expected file-count chunking marker (unaffected by unmeasured cap) in stderr; STDERR:\n${r.stderr}`,
+      );
+      assert.match(
+        r.stderr,
+        /run-tests: chunk 3\/3 — 2 files/,
+        `expected final file-count chunking marker (unaffected by unmeasured cap) in stderr; STDERR:\n${r.stderr}`,
+      );
+    });
+
     // #2088: expensive files must never all land in one chunk — otherwise the
     // unsharded targeted lane packs the whole install surface into a single chunk
     // that blows the 600s per-chunk backstop on the slow Windows runner. #2088
@@ -2307,6 +2340,7 @@ const {
   loadTestTimings,
   positiveNumberEnv,
   DEFAULT_TIMINGS_PATH,
+  defaultMaxUnmeasuredPerChunk,
 } = require('../scripts/run-tests.cjs');
 
 describe('chunk packing weights measured cost (#2456)', () => {
@@ -2912,6 +2946,191 @@ describe('chunk packing weights measured cost (#2456)', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// packChunks unmeasured-file cap — red `next` @ccfed6335 (2026-09-20, shard
+// 3/3 chunk 6/8) and @af822a80 (2026-09-23, shard 2/3 chunk 7/9). Both chunks
+// were killed at 600000ms+ with zero failing tests, each holding 5-6 files
+// absent from tests/test-timings.json (new conformance-tier files, never
+// profiled) packed alongside the chunk's measured files: each unmeasured
+// file's GUESSED weight looked affordable alone, the chunk's total weight
+// still cleared the existing budget, and the chunk still blew the 600s
+// backstop because several guesses compounded. See packChunks'
+// isMeasured/maxUnmeasuredPerChunk comment for the fix rationale.
+// ---------------------------------------------------------------------------
+
+describe('packChunks unmeasured-file cap (red next @ccfed6335, @af822a80, 2026-09-20/23)', () => {
+  const UC_FIXED_OVERHEAD = 120;
+  const UC_ROOMY_CHARS = 100000;
+
+  // Trivial, uniform weight model — this suite is about the COUNT cap, not
+  // weight — so any weight-driven splitting is ruled out by a generous
+  // maxWeight.
+  const weightOf = () => 1;
+  const isNewFile = (file) => /^new-\d+\.test\.cjs$/.test(file);
+
+  const countUnmeasured = (chunk) => chunk.filter((f) => isNewFile(f)).length;
+
+  test('reproduces the incident shape and proves the fix', () => {
+    const unmeasured = Array.from({ length: 6 }, (_, i) => `new-${i}.test.cjs`);
+    const measured = ['heavy-a.test.cjs', 'heavy-b.test.cjs'];
+    const files = [...unmeasured, ...measured];
+
+    const capped = packChunks(files, {
+      weightOf,
+      maxWeight: 100, // roomy — weight alone would never force a split
+      maxChars: UC_ROOMY_CHARS,
+      fixedOverhead: UC_FIXED_OVERHEAD,
+      isMeasured: (f) => !isNewFile(f),
+      maxUnmeasuredPerChunk: 2,
+    });
+    assert.ok(capped.length >= 3, `expected at least 3 chunks with the cap applied, got ${capped.length}`);
+    for (const [i, chunk] of capped.entries()) {
+      assert.ok(countUnmeasured(chunk) <= 2, `chunk ${i} holds ${countUnmeasured(chunk)} unmeasured files, cap is 2`);
+    }
+    assert.strictEqual(capped.flat().length, files.length, 'no file may be dropped or duplicated');
+
+    // Without the cap (omitted), all 8 files pack into a single chunk — this
+    // is the pre-fix behavior the cap must change.
+    const uncapped = packChunks(files, {
+      weightOf,
+      maxWeight: 100,
+      maxChars: UC_ROOMY_CHARS,
+      fixedOverhead: UC_FIXED_OVERHEAD,
+      isMeasured: (f) => !isNewFile(f),
+      // maxUnmeasuredPerChunk intentionally omitted
+    });
+    assert.strictEqual(uncapped.length, 1, 'without a cap, weight/chars alone keep all 8 files in one chunk');
+  });
+
+  describe('boundary (cap-1 / cap / cap+1)', () => {
+    const CAP = 3;
+
+    test('cap-1 unmeasured files fit one chunk', () => {
+      const files = Array.from({ length: CAP - 1 }, (_, i) => `new-${i}.test.cjs`);
+      const chunks = packChunks(files, {
+        weightOf,
+        maxWeight: 100,
+        maxChars: UC_ROOMY_CHARS,
+        fixedOverhead: UC_FIXED_OVERHEAD,
+        isMeasured: (f) => !isNewFile(f),
+        maxUnmeasuredPerChunk: CAP,
+      });
+      assert.strictEqual(chunks.length, 1, `${CAP - 1} unmeasured files under cap ${CAP} must fit one chunk`);
+    });
+
+    test('exactly cap unmeasured files fit one chunk', () => {
+      const files = Array.from({ length: CAP }, (_, i) => `new-${i}.test.cjs`);
+      const chunks = packChunks(files, {
+        weightOf,
+        maxWeight: 100,
+        maxChars: UC_ROOMY_CHARS,
+        fixedOverhead: UC_FIXED_OVERHEAD,
+        isMeasured: (f) => !isNewFile(f),
+        maxUnmeasuredPerChunk: CAP,
+      });
+      assert.strictEqual(chunks.length, 1, `${CAP} unmeasured files at cap ${CAP} must fit one chunk`);
+    });
+
+    test('cap+1 unmeasured files require a second chunk', () => {
+      const files = Array.from({ length: CAP + 1 }, (_, i) => `new-${i}.test.cjs`);
+      const chunks = packChunks(files, {
+        weightOf,
+        maxWeight: 100,
+        maxChars: UC_ROOMY_CHARS,
+        fixedOverhead: UC_FIXED_OVERHEAD,
+        isMeasured: (f) => !isNewFile(f),
+        maxUnmeasuredPerChunk: CAP,
+      });
+      assert.strictEqual(chunks.length, 2, `${CAP + 1} unmeasured files over cap ${CAP} must split into 2 chunks`);
+      for (const [i, chunk] of chunks.entries()) {
+        assert.ok(countUnmeasured(chunk) <= CAP, `chunk ${i} holds ${countUnmeasured(chunk)} unmeasured, cap is ${CAP}`);
+      }
+    });
+  });
+
+  test('backward compatible: isMeasured omitted treats every file as measured, cap is a no-op', () => {
+    const files = Array.from({ length: 8 }, (_, i) => `new-${i}.test.cjs`);
+    const withoutIsMeasured = packChunks(files, {
+      weightOf,
+      maxWeight: 100,
+      maxChars: UC_ROOMY_CHARS,
+      fixedOverhead: UC_FIXED_OVERHEAD,
+      maxUnmeasuredPerChunk: 2, // has no effect: nothing is "unmeasured" without isMeasured
+    });
+    const noCapAtAll = packChunks(files, {
+      weightOf,
+      maxWeight: 100,
+      maxChars: UC_ROOMY_CHARS,
+      fixedOverhead: UC_FIXED_OVERHEAD,
+    });
+    assert.deepStrictEqual(withoutIsMeasured, noCapAtAll, 'omitting isMeasured must reproduce the no-cap packing exactly');
+    assert.strictEqual(withoutIsMeasured.length, 1, 'all 8 files land in one chunk, matching pre-fix behavior');
+  });
+
+  describe('maxUnmeasuredPerChunk degrades safely', () => {
+    test('no-op when zero files are unmeasured', () => {
+      const files = ['measured-a.test.cjs', 'measured-b.test.cjs', 'measured-c.test.cjs'];
+      const chunks = packChunks(files, {
+        weightOf,
+        maxWeight: 100,
+        maxChars: UC_ROOMY_CHARS,
+        fixedOverhead: UC_FIXED_OVERHEAD,
+        isMeasured: () => true,
+        maxUnmeasuredPerChunk: 2,
+      });
+      assert.strictEqual(chunks.length, 1, 'a cap with nothing unmeasured must not affect packing');
+    });
+
+    test('a NaN override degrades to no cap rather than throwing', () => {
+      const files = Array.from({ length: 8 }, (_, i) => `new-${i}.test.cjs`);
+      assert.doesNotThrow(() => {
+        const chunks = packChunks(files, {
+          weightOf,
+          maxWeight: 100,
+          maxChars: UC_ROOMY_CHARS,
+          fixedOverhead: UC_FIXED_OVERHEAD,
+          isMeasured: (f) => !isNewFile(f),
+          maxUnmeasuredPerChunk: NaN,
+        });
+        assert.strictEqual(chunks.length, 1, 'NaN cap must degrade to unbounded, all 8 files in one chunk');
+      });
+    });
+
+    test('a negative override degrades to no cap rather than throwing', () => {
+      const files = Array.from({ length: 8 }, (_, i) => `new-${i}.test.cjs`);
+      assert.doesNotThrow(() => {
+        const chunks = packChunks(files, {
+          weightOf,
+          maxWeight: 100,
+          maxChars: UC_ROOMY_CHARS,
+          fixedOverhead: UC_FIXED_OVERHEAD,
+          isMeasured: (f) => !isNewFile(f),
+          maxUnmeasuredPerChunk: -1,
+        });
+        assert.strictEqual(chunks.length, 1, 'negative cap must degrade to unbounded, all 8 files in one chunk');
+      });
+    });
+  });
+
+  describe('defaultMaxUnmeasuredPerChunk platform behavior', () => {
+    test('win32 default is 2', () => {
+      assert.strictEqual(defaultMaxUnmeasuredPerChunk('win32'), 2);
+    });
+
+    test('linux and darwin defaults are Infinity (unbounded)', () => {
+      assert.strictEqual(defaultMaxUnmeasuredPerChunk('linux'), Infinity);
+      assert.strictEqual(defaultMaxUnmeasuredPerChunk('darwin'), Infinity);
+    });
+
+    test('the default is still overridable by RUN_TESTS_MAX_UNMEASURED_PER_CHUNK', () => {
+      const def = defaultMaxUnmeasuredPerChunk('win32');
+      const override = positiveNumberEnv('7', def);
+      assert.strictEqual(override, 7);
+      assert.notStrictEqual(override, def);
+    });
+  });
+});
+
 // ─── analyzeChunkEvents (#3889 durability fix) ──────────────────────────────
 //
 // scripts/lib/ndjson-reporter.cjs now writes durably (fs.appendFileSync to a
@@ -3462,5 +3681,274 @@ describe('the win32 per-chunk cap must not permit a chunk that exceeds the 600s 
     const override = positiveNumberEnv('99', cap);
     assert.strictEqual(override, 99);
     assert.notStrictEqual(override, cap);
+  });
+});
+
+// #4936: the per-chunk watchdog. The chunk used to run under
+// execFileSync({ timeout }), whose diagnostic lived in a catch arm reachable
+// only once the child's exit was OBSERVED — so on a Windows run where that
+// observation never came, a chunk sat 37 minutes past its 600000ms bound with
+// no kill line and no in-flight-file report. A real "kill sent, exit never
+// reported" Windows process cannot be produced on demand, so these tests drive
+// runChunk through its injected seams (a fake child that never emits 'exit',
+// a recording spawnSync, a forced platform), plus one real child that ignores
+// its first kill signal.
+const { runChunk, killChunkTree } = require('../scripts/run-tests.cjs');
+const { EventEmitter } = require('node:events');
+
+// Watchdog bounds for these tests — a distinct class from every subprocess
+// timeout in tests/helpers/timeouts.cjs. The fake-child bounds only need to
+// ORDER the timeout before the grace expiry, so they are tiny; nothing real
+// runs under them.
+const FAKE_CHUNK_TIMEOUT_MS = 20;
+const FAKE_CHUNK_GRACE_MS = 50;
+// A grace long enough that a child exiting on its first kill is always
+// observed inside it.
+const FAKE_CHUNK_LONG_GRACE_MS = 5000;
+// A bound that must never fire: the chunk under it exits on its own at once.
+const UNREACHED_CHUNK_TIMEOUT_MS = 60000;
+// The real-child test: long enough for `node -e` to install its SIGTERM trap
+// before the kill lands, so the first kill is genuinely ignored on POSIX.
+const REAL_CHILD_TIMEOUT_MS = 2000;
+const REAL_CHILD_GRACE_MS = 1000;
+
+// A stand-in ChildProcess. It never exits unless `exitOn` names the signal
+// whose delivery should make it exit.
+function fakeChunkChild({ pid = 4242, exitOn = null } = {}) {
+  const child = new EventEmitter();
+  child.pid = pid;
+  child.kills = [];
+  child.unrefCalls = 0;
+  child.kill = (signal) => {
+    child.kills.push(signal);
+    if (exitOn === signal) setImmediate(() => child.emit('exit', null, signal));
+    return true;
+  };
+  child.unref = () => {
+    child.unrefCalls += 1;
+  };
+  return child;
+}
+
+// A stand-in for the spawned tree reaper. `exitCode` undefined = it never
+// exits (a wedged reaper); `emitError` = it fails to spawn asynchronously.
+function fakeReaper({ exitCode, emitError = false } = {}) {
+  const calls = [];
+  const reapers = [];
+  const impl = (command, args) => {
+    calls.push([command, args]);
+    const reaper = new EventEmitter();
+    reaper.unrefCalls = 0;
+    reaper.unref = () => {
+      reaper.unrefCalls += 1;
+    };
+    reapers.push(reaper);
+    if (emitError) setImmediate(() => reaper.emit('error', new Error('spawn taskkill ENOENT')));
+    else if (exitCode !== undefined) setImmediate(() => reaper.emit('exit', exitCode, null));
+    return reaper;
+  };
+  return { calls, reapers, impl };
+}
+
+const nextTick = () => new Promise((r) => setImmediate(r));
+
+describe('runChunk per-chunk watchdog (#4936)', () => {
+  test('a chunk that exits on its own resolves with its code and never fires the timeout', async () => {
+    let fired = 0;
+    const r = await runChunk(process.execPath, ['-e', 'process.exit(3)'], {
+      env: process.env,
+      timeoutMs: UNREACHED_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_GRACE_MS,
+      onTimeout: () => {
+        fired += 1;
+      },
+    });
+    assert.deepStrictEqual(
+      { code: r.code, timedOut: r.timedOut, exitObserved: r.exitObserved },
+      { code: 3, timedOut: false, exitObserved: true },
+    );
+    assert.strictEqual(fired, 0, 'onTimeout must not fire for a chunk that exits inside its bound');
+  });
+
+  test('REGRESSION: a child whose exit is never observed still gets its diagnostic at the bound and a bounded return', async () => {
+    // The #4936 shape: the kill is sent and the exit is never reported back.
+    // Pre-#4936 this was an unbounded wait with the diagnostic unreachable.
+    const child = fakeChunkChild();
+    const order = [];
+    const r = await runChunk('unused', [], {
+      timeoutMs: FAKE_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_GRACE_MS,
+      platform: 'linux',
+      spawnImpl: () => child,
+      onTimeout: () => order.push('diagnostic'),
+    });
+    order.push('resolved');
+    assert.deepStrictEqual(order, ['diagnostic', 'resolved'],
+      'the diagnostic must fire at the bound, before (not instead of) the runner moving on');
+    assert.strictEqual(r.timedOut, true);
+    assert.strictEqual(r.exitObserved, false);
+    assert.deepStrictEqual(child.kills, ['SIGTERM', 'SIGKILL'],
+      'first the ordinary kill, then one escalation once the grace window expires');
+    assert.strictEqual(child.unrefCalls, 1, 'an unconfirmed child must be unref\'d so the runner process can exit');
+  });
+
+  test('a child that exits after the kill reports a timeout with its exit observed, and is not abandoned', async () => {
+    const child = fakeChunkChild({ exitOn: 'SIGTERM' });
+    let fired = 0;
+    const r = await runChunk('unused', [], {
+      timeoutMs: FAKE_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_LONG_GRACE_MS,
+      platform: 'linux',
+      spawnImpl: () => child,
+      onTimeout: () => {
+        fired += 1;
+      },
+    });
+    assert.strictEqual(fired, 1);
+    assert.strictEqual(r.timedOut, true);
+    assert.strictEqual(r.exitObserved, true);
+    assert.deepStrictEqual(child.kills, ['SIGTERM'], 'no escalation once the exit is observed');
+    assert.strictEqual(child.unrefCalls, 0);
+  });
+
+  test('a diagnostic that throws does not stop the bound from being enforced', async () => {
+    const child = fakeChunkChild();
+    const r = await runChunk('unused', [], {
+      timeoutMs: FAKE_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_GRACE_MS,
+      platform: 'linux',
+      spawnImpl: () => child,
+      onTimeout: () => {
+        throw new Error('diagnostic blew up');
+      },
+    });
+    assert.strictEqual(r.timedOut, true);
+    assert.strictEqual(r.exitObserved, false);
+  });
+
+  test('a spawn failure resolves as a failed, non-timed-out chunk instead of throwing', async () => {
+    const r = await runChunk('unused', [], {
+      timeoutMs: UNREACHED_CHUNK_TIMEOUT_MS,
+      spawnImpl: () => {
+        throw new Error('spawn EMFILE');
+      },
+    });
+    assert.strictEqual(r.timedOut, false);
+    assert.strictEqual(r.code, 1);
+    assert.match(r.error.message, /EMFILE/);
+  });
+
+  test('on win32 the first kill reaps the whole tree (#4601 shape), not just the direct child', async () => {
+    const child = fakeChunkChild({ pid: 4242 });
+    const reap = fakeReaper({ exitCode: 0 });
+    const r = await runChunk('unused', [], {
+      timeoutMs: FAKE_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_GRACE_MS,
+      platform: 'win32',
+      spawnImpl: () => child,
+      reapSpawnImpl: reap.impl,
+    });
+    assert.deepStrictEqual(reap.calls, [['taskkill', ['/PID', '4242', '/T', '/F']]]);
+    assert.strictEqual(reap.reapers[0].unrefCalls, 1, 'the reaper must never keep the runner alive');
+    assert.deepStrictEqual(child.kills, ['SIGKILL'],
+      'a successful tree reap replaces the direct first kill; only the grace escalation follows');
+    assert.strictEqual(r.exitObserved, false);
+  });
+
+  test('REGRESSION: a tree reaper that never exits delays neither the diagnostic nor the bound', async () => {
+    // A synchronous reap (spawnSync) returns only once the reaper's own exit is
+    // observed, so it could re-create the #4936 stall one layer down. The
+    // reaper is spawned and never awaited.
+    const child = fakeChunkChild();
+    const reap = fakeReaper();
+    const order = [];
+    const r = await runChunk('unused', [], {
+      timeoutMs: FAKE_CHUNK_TIMEOUT_MS,
+      graceMs: FAKE_CHUNK_GRACE_MS,
+      platform: 'win32',
+      spawnImpl: () => child,
+      reapSpawnImpl: reap.impl,
+      onTimeout: () => order.push('diagnostic'),
+    });
+    order.push('resolved');
+    assert.deepStrictEqual(order, ['diagnostic', 'resolved']);
+    assert.strictEqual(r.timedOut, true);
+    assert.strictEqual(r.exitObserved, false);
+    assert.deepStrictEqual(child.kills, ['SIGKILL']);
+  });
+
+  test('on win32 a failed tree reap falls through to the direct kill', async () => {
+    const child = fakeChunkChild();
+    const reap = fakeReaper({ exitCode: 128 });
+    assert.strictEqual(killChunkTree(child, { platform: 'win32', reapSpawnImpl: reap.impl }), 'tree');
+    assert.deepStrictEqual(child.kills, [], 'the direct kill waits for the reaper\'s verdict');
+    await nextTick();
+    assert.deepStrictEqual(child.kills, ['SIGTERM']);
+  });
+
+  test('on win32 a reaper that cannot start falls through to the direct kill, once', async () => {
+    const child = fakeChunkChild();
+    const reap = fakeReaper({ emitError: true });
+    killChunkTree(child, { platform: 'win32', reapSpawnImpl: reap.impl });
+    await nextTick();
+    assert.deepStrictEqual(child.kills, ['SIGTERM']);
+
+    const child2 = fakeChunkChild();
+    const throwing = () => {
+      throw new Error('spawn EMFILE');
+    };
+    assert.strictEqual(killChunkTree(child2, { platform: 'win32', reapSpawnImpl: throwing }), 'direct');
+    assert.deepStrictEqual(child2.kills, ['SIGTERM']);
+  });
+
+  test('off win32 the kill never spawns a tree reap', () => {
+    for (const platform of ['linux', 'darwin']) {
+      const child = fakeChunkChild();
+      const reap = fakeReaper({ exitCode: 0 });
+      assert.strictEqual(killChunkTree(child, { platform, reapSpawnImpl: reap.impl }), 'direct');
+      assert.deepStrictEqual(reap.calls, [], `${platform} must not spawn a tree reap`);
+      assert.deepStrictEqual(child.kills, ['SIGTERM']);
+    }
+  });
+
+  test('a real child that ignores its first kill signal is still bounded, and its diagnostic still fires first', async (t) => {
+    // On POSIX the child traps SIGTERM, so the first kill does nothing and
+    // only the grace escalation ends the wait — the "kill sent, no exit"
+    // state with a real process. On Windows the kill is TerminateProcess,
+    // which the child cannot trap, so only the bound and ordering are asserted
+    // there. The child writes a marker once its trap is installed; the POSIX
+    // assertion applies only when the trap was armed before the kill, so a
+    // slow child start cannot turn it into a flake.
+    const dir = createTempDir('gsd-4936-real-child-');
+    t.after(() => cleanup(dir));
+    const marker = path.join(dir, 'trap-armed');
+    const script =
+      "process.on('SIGTERM', () => {}); " +
+      "require('fs').writeFileSync(process.argv[1], 'armed'); " +
+      'setInterval(() => {}, 1000);';
+    // Reaching the assertions at all is the bound: pre-#4936 (execFileSync
+    // with a timeout) the same child blocked the runner indefinitely.
+    const order = [];
+    let trapArmedAtKill = false;
+    const r = await runChunk(process.execPath, ['-e', script, marker], {
+      env: process.env,
+      timeoutMs: REAL_CHILD_TIMEOUT_MS,
+      graceMs: REAL_CHILD_GRACE_MS,
+      onTimeout: () => {
+        trapArmedAtKill = fs.existsSync(marker);
+        order.push('diagnostic');
+      },
+    });
+    order.push('resolved');
+    assert.deepStrictEqual(order, ['diagnostic', 'resolved']);
+    assert.strictEqual(r.timedOut, true);
+    if (process.platform !== 'win32') {
+      if (trapArmedAtKill) {
+        assert.strictEqual(r.exitObserved, false, 'a SIGTERM-trapping child must be abandoned after the grace window');
+      } else {
+        // Visible, never silent: the abandonment arm was not exercised this run.
+        t.diagnostic('child had not armed its SIGTERM trap before the kill; abandonment not asserted this run');
+      }
+    }
   });
 });
