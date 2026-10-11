@@ -32,9 +32,10 @@ import { isCanonicalPlanningFile, CANONICAL_EXACT } from './artifacts.cjs';
 // `frontmatter.cts` uses `export =` (CJS-style single export object), so it
 // is imported as a default import (esModuleInterop), not a named import.
 import frontmatterModule from './frontmatter.cjs';
+import { locateFrontmatterFence } from './frontmatter-fence.cjs';
 import type { Result } from './write-set.cjs';
 
-const { frontmatterRegion, extractFrontmatter, FRONTMATTER_UNPARSEABLE } = frontmatterModule;
+const { extractFrontmatter, FRONTMATTER_UNPARSEABLE } = frontmatterModule;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -193,47 +194,27 @@ function splitLinesInfo(source: string): LineInfo[] {
 }
 
 /**
- * Locate the frontmatter block, if any, by COMPOSING `frontmatter.cts`'s
- * `frontmatterRegion` — the fence-detection grammar (byte-0 rule, BOM strip,
- * `\n---` search, CR handling) lives there, once, and this seam never
- * re-derives it (ADR-4910 Decision 1).
+ * Locate the frontmatter block, if any, from `locateFrontmatterFence` — the
+ * one owner of the fence grammar (byte-0 rule, BOM tolerance, whole-line
+ * closing fence, an adjacent empty block), which every frontmatter reader and
+ * writer also reads; this seam never re-derives it (ADR-4910 Decision 1).
  *
- * `frontmatterRegion` reports the YAML body's own bounds (`region`,
- * `terminated`, and the possibly BOM-stripped `content`), not this seam's
- * `Span` shape (an absolute byte range into the UNSTRIPPED `source`,
- * inclusive of both fences). This adapter translates one into the other by
- * reading ONLY the two boundary characters `frontmatterRegion` already
- * anchored (whether the YAML end / closing fence sit on a CRLF line) — it
- * does not re-scan for the fences themselves.
+ * The span is an absolute range into `source`, from the opening fence (after
+ * any BOM) through the closing fence line's text, plus that line's CR when it
+ * ends in CRLF. Found while implementing #5105: the previous adapter re-derived
+ * the closing fence's end from the YAML region's length and was one character
+ * long on an adjacent empty block (`---\n---\n`), which has no line of its own
+ * before the closer.
  */
 function findFrontmatterSpan(source: string): { span: Span; terminated: boolean } | null {
-  const found = frontmatterRegion(source);
-  if (!found) return null;
-
-  // `found.content` may be `source` with a single leading BOM stripped;
-  // every offset below is relative to `found.content`, so translate back to
-  // `source` coordinates by the same delta.
-  const bomDelta = source.length - found.content.length;
-  const content = found.content;
-
-  if (!found.terminated) {
-    return { span: { start: bomDelta, end: bomDelta + content.length }, terminated: false };
+  const fence = locateFrontmatterFence(source);
+  if (!fence) return null;
+  const start = fence.bom.length;
+  if (!fence.closed) {
+    return { span: { start, end: source.length }, terminated: false };
   }
-
-  // `frontmatterRegion` already did fence DETECTION — `found` being non-null
-  // and `terminated` IS that result. It reports only the YAML body's bounds
-  // (`region`), not an absolute span, so recover the closing fence's end
-  // from `region`'s length. The one thing still read directly here is the
-  // opening fence's fixed-width line ending (`\n` vs `\r\n`), needed to
-  // translate `region`'s length into a `content` offset — not a re-scan for
-  // the fence itself.
-  const headerEnd = content.startsWith('---\r\n') ? 5 : 4;
-  const yamlEnd = headerEnd + found.region.length;
-  const closingLineStart = content[yamlEnd] === '\r' ? yamlEnd + 1 : yamlEnd;
-  const fenceLineStart = closingLineStart + 1;
-  let fenceEnd = fenceLineStart + 3;
-  if (content[fenceEnd] === '\r') fenceEnd += 1;
-  return { span: { start: bomDelta, end: bomDelta + fenceEnd }, terminated: true };
+  const end = fence.closingFenceEnd + (source[fence.closingFenceEnd] === '\r' ? 1 : 0);
+  return { span: { start, end }, terminated: true };
 }
 
 /** Build the set of 0-based line indices that fall inside a fenced code
@@ -520,7 +501,10 @@ export function readNode(doc: PlanningDoc, id: NodeId): NodeRead {
 function parseFrontmatterRegion(
   regionText: string,
 ): { ok: true; value: Record<string, FrontmatterFieldValue> } | { ok: false } {
-  const fm = extractFrontmatter(regionText);
+  // A CRLF block's span ends on its closing fence line's CR (`findFrontmatterSpan`). That CR is
+  // half a line ending, not part of the fence: a `---` line ended by a lone CR does not close a
+  // block, so the text is parsed without it.
+  const fm = extractFrontmatter(regionText.endsWith('\r') ? regionText.slice(0, -1) : regionText);
   if ((fm as unknown as Record<symbol, unknown>)[FRONTMATTER_UNPARSEABLE] === true) {
     return { ok: false };
   }
@@ -613,7 +597,7 @@ export function readFrontmatterField(doc: PlanningDoc, key: string): NodeRead<Fr
  * `PlanningDoc` capability (sections/tables/checklists) this seam offers.
  *
  * Locates the frontmatter span via `findFrontmatterSpan` — the SAME
- * `frontmatterRegion`-composing helper `parsePlanningDoc` itself uses to
+ * `locateFrontmatterFence`-reading helper `parsePlanningDoc` itself uses to
  * build a `FrontmatterNode` — so this is not a second detection mechanism,
  * only a bypass of the node-parsing pipeline neither this caller nor its
  * content needs.
@@ -817,6 +801,48 @@ export function serialize(doc: PlanningDoc): SerializeOutcome {
   out += doc.source.slice(cursor);
 
   return { ok: true, value: out };
+}
+
+/**
+ * Replace every occurrence of the single-line literal `from` with `to` in the
+ * document's prose — the seam's answer to a verbatim cross-reference rewrite
+ * (ADR-5057 §6, Phase 13, #5217: the migration's "Phase 1:" -> "Phase 1-01:"
+ * substitution in PROJECT.md / STATE.md).
+ *
+ * Fenced code blocks are never rewritten (rows 9/14: fenced content is not a
+ * node), every other byte — each line's own terminator included — is copied
+ * from `doc.source`, and a substitution that changes nothing returns a doc
+ * whose `source` is byte-identical. The result is re-parsed so its node spans
+ * describe the new text. Refuses (Result failure, nothing written) when `from`
+ * is empty or spans a line break, or when `doc` already carries staged
+ * field edits (their spans address the pre-substitution text).
+ */
+export function replaceProse(doc: PlanningDoc, from: string, to: string): Result<PlanningDoc> {
+  if (typeof from !== 'string' || from.length === 0) {
+    return { ok: false, reason: 'replaceProse: `from` must be a non-empty string' };
+  }
+  if (typeof to !== 'string' || /[\r\n]/.test(from) || /[\r\n]/.test(to)) {
+    return { ok: false, reason: 'replaceProse: `from` and `to` must be single-line strings' };
+  }
+  if (doc.staged.size > 0) {
+    return { ok: false, reason: 'replaceProse: refused while field edits are staged' };
+  }
+
+  const lines = splitLinesInfo(doc.source);
+  const fenced = fencedLineIndices(lines);
+  let out = '';
+  let cursor = 0;
+  let changed = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (fenced.has(i) || !line.text.includes(from)) continue;
+    out += doc.source.slice(cursor, line.start) + line.text.split(from).join(to);
+    cursor = line.end;
+    changed = true;
+  }
+  if (!changed) return { ok: true, value: doc };
+  out += doc.source.slice(cursor);
+  return parsePlanningDoc(out, doc.artifact);
 }
 
 // Consumers: require('../gsd-core/bin/lib/planning-document.cjs')

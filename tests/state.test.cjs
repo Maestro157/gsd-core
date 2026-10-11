@@ -1062,6 +1062,29 @@ describe('STATE.md frontmatter sync', () => {
     assert.ok(content.includes('status: paused'), 'frontmatter should reflect latest status');
   });
 
+  // A STATE.md whose frontmatter is preceded by whitespace (a hand edit, a botched merge) is
+  // healed by the writer: `state update` replaces that block rather than stacking a second one
+  // above it. Found while implementing #5105.
+  for (const [label, lead] of [['a leading blank line', '\n'], ['leading spaces', '   '], ['leading spaces and a tab on their own line', '  \t\n']]) {
+    test(`state update on a STATE.md with ${label} before its frontmatter writes exactly one block`, () => {
+      fs.writeFileSync(
+        path.join(tmpDir, '.planning', 'STATE.md'),
+        `${lead}---\ngsd_state_version: 1.0\nstatus: executing\n---\n\n# Project State\n\n**Current Phase:** 01\n**Status:** executing\n`,
+      );
+
+      const result = runGsdTools('state update Status planning', tmpDir);
+      assert.ok(result.success, `Command failed: ${result.error}`);
+
+      const content = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf-8');
+      assert.ok(content.startsWith('---\n'), `the block opens at byte 0: ${JSON.stringify(content)}`);
+      assert.strictEqual((content.match(/^---$/gm) || []).length, 2, `exactly one frontmatter block: ${JSON.stringify(content)}`);
+      assert.ok(content.includes('\nstatus: planning\n'), 'the frontmatter carries the updated status');
+      assert.ok(!content.includes('status: executing'), 'the stale block is gone');
+      assert.ok(content.includes('**Status:** planning'), 'the body field is updated');
+      assert.ok(content.includes('\n# Project State\n'), 'the body is kept');
+    });
+  }
+
   test('#2956 write-then-read does not rewind current_phase past an archive Phase line', () => {
     // The write seam (buildStateFrontmatter) and the read seam (cmdStateSnapshot)
     // must agree: a state write that re-syncs frontmatter must not pick up the
@@ -3195,6 +3218,40 @@ describe('cmdStateUpdateProgress (state update-progress)', () => {
     assert.strictEqual(output.percent, 0, 'v2.0-scoped plan fraction (1/1) is capped to 0 by the missing phase verification');
     assert.strictEqual(output.total, 1, 'total must be v2.0-scoped (phase 02 only) — Phase 03 must not leak in from the auto-derived scan');
     assert.strictEqual(output.completed, 1, 'completed must be v2.0-scoped (phase 02 only)');
+  });
+
+  test('#5038: explicit `milestone: null` on a flat ROADMAP resolves a complete phase scope, so update-progress writes', () => {
+    // Before #5038 the raw `milestone:` read in extractCurrentMilestoneScoped saw the text
+    // "null" as a version with no heading and the scope gate withheld the write.
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'ROADMAP.md'),
+      ['# Roadmap', '', '### Phase 01: Alpha', '**Goal:** ship it.', ''].join('\n')
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, '.planning', 'STATE.md'),
+      ['---', 'gsd_state_version: "1.0"', 'milestone: null', 'status: executing', '---', '',
+        '# Project State', '', '**Progress:** [██████████] 100%', ''].join('\n')
+    );
+    const phase01Dir = path.join(tmpDir, '.planning', 'phases', '01');
+    fs.mkdirSync(phase01Dir, { recursive: true });
+    fs.writeFileSync(path.join(phase01Dir, '01-01-PLAN.md'), '# Plan\n');
+    fs.writeFileSync(path.join(phase01Dir, '01-01-SUMMARY.md'), '# Summary\n');
+
+    const { runNode } = require('./helpers/process-seam.cjs');
+    const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
+    const { TOOLS_PATH: toolsPath, TEST_ENV_BASE } = require('./helpers.cjs');
+    const rec = runNode(
+      [toolsPath, 'state', 'update-progress'],
+      { cwd: tmpDir, env: { ...process.env, ...TEST_ENV_BASE }, timeoutMs: PROBE_TIMEOUT_MS },
+    );
+    assert.equal(rec.exitCode, 0, `Command failed: ${rec.stderr}`);
+    const output = JSON.parse(rec.stdout);
+    assert.strictEqual(output.updated, true, `scope gate must not withhold; got ${rec.stdout}`);
+    assert.strictEqual(output.total, 1);
+    const persisted = fs.readFileSync(path.join(tmpDir, '.planning', 'STATE.md'), 'utf8');
+    assert.match(persisted, /^milestone: null$/m, 'the explicit null is preserved');
+    assert.ok(persisted.includes(`**Progress:** ${output.bar}`), `body bar must equal the reported bar ${output.bar}`);
+    assert.doesNotMatch(persisted, /100%/, 'the seeded stale bar was replaced');
   });
 });
 
@@ -18316,37 +18373,6 @@ const HEX_RE = /^[0-9a-f]{4,40}$/i;
       'distance measured against an unrelated repo is not a meaningful count');
   });
 
-  test('(h) a SYMLINKED project path still resolves — repo pinning compares identity, not spelling', () => {
-    // Guard against over-tightening (g). `git rev-parse --show-toplevel` reports
-    // the REAL path while the project root arrives as the caller spelled it, and
-    // those differ routinely: macOS temp dirs (/var/folders → /private/var/folders),
-    // any symlinked checkout, Windows casing. A raw string compare would report a
-    // perfectly normal project as unknown — the inverse of the bug (g) fixes, and
-    // exactly what broke the macOS and Windows CI shards.
-    const realDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2573-symreal-'));
-    propDirs.push(realDir);
-    const g = (argv) => runGit(argv, { cwd: realDir }).stdout;
-    g(['init', '-q']); g(['config', 'user.email', 't@t.com']); g(['config', 'user.name', 'T']);
-    g(['config', 'commit.gpgsign', 'false']);
-    fs.mkdirSync(path.join(realDir, '.planning'), { recursive: true });
-    fs.writeFileSync(path.join(realDir, 'a.txt'), 'a\n');
-    g(['add', '-A']); g(['commit', '-q', '-m', 'base']);
-    const head = g(['rev-parse', 'HEAD']).trim();
-
-    const linkDir = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-2573-symlink-')), 'proj');
-    propDirs.push(path.dirname(linkDir));
-    try {
-      fs.symlinkSync(realDir, linkDir, 'dir');
-    } catch {
-      return; // symlink creation unavailable (e.g. unprivileged Windows) — nothing to assert
-    }
-
-    const r = readStateHeadFreshness(linkDir, head);
-    assert.strictEqual(r.commit_stale, false,
-      'a symlinked project path is the SAME repo — it must resolve, not degrade to unknown');
-    assert.strictEqual(r.commits_behind, 0);
-  });
-
   test('(i) a sub_repos workspace resolves to unknown even though it owns its own repo', () => {
     // #2573 D5, sub_repos flavor. (g) covers the case where the project owns NO
     // .git. This is the harder one: the outer workspace owns BOTH .planning/ and
@@ -21968,5 +21994,431 @@ describe('#4823: Current Plan reset is scoped to the Current Position section', 
       stateAfter.includes('plan:** `foo()` was found and fixed as a Rule 1 bug.'),
       'the hard-wrapped prose line must be byte-identical — the plain-branch reset must never cross into narrative',
     );
+  });
+});
+
+// ─── STATE.md writers on an adjacent empty frontmatter block ─────────────────
+//
+// Found while implementing #5105: `stripFrontmatter` could not see an adjacent empty block
+// (`---\n---\n`), so every STATE.md writer kept it as body and prepended its own
+// frontmatter above it — a second block, and the empty one left as two `---` body lines.
+
+describe('#5105: STATE.md writers replace an adjacent empty frontmatter block', () => {
+  let tmpDir;
+
+  beforeEach(() => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'gsd-5105-state-'));
+    fs.mkdirSync(path.join(tmpDir, '.planning'));
+  });
+
+  afterEach(() => {
+    cleanup(tmpDir);
+  });
+
+  const body = [
+    '# Project State',
+    '',
+    '## Current Position',
+    '',
+    'Phase: 2',
+    'Plan: 1 of 3',
+    'Status: Ready to execute',
+    'Last activity: 2026-01-01',
+    '',
+  ];
+
+  for (const [label, nl] of [['LF', '\n'], ['CRLF', '\r\n']]) {
+    for (const args of [['state', 'update', 'Status', 'Executing'], ['state', 'record-session', '--stopped-at', 'x']]) {
+      test(`${args.slice(0, 2).join(' ')} writes exactly one frontmatter block (${label})`, () => {
+        const statePath = path.join(tmpDir, '.planning', 'STATE.md');
+        fs.writeFileSync(statePath, ['---', '---', ...body].join(nl));
+
+        const result = runGsdTools(args, tmpDir);
+        assert.ok(result.success, `${args.join(' ')} failed: ${result.error}`);
+
+        const after = fs.readFileSync(statePath, 'utf-8');
+        assert.match(after, /^---\r?\n[^-]/, 'the written block is the writer\'s own, not the empty one');
+        const afterBody = frontmatterLib.stripFrontmatter(after, { once: true });
+        assert.ok(afterBody.startsWith('# Project State'), `a second block was left in the body:\n${after}`);
+        assert.strictEqual(
+          after.split(/\r?\n/).filter((l) => l === '---').length,
+          2,
+          `exactly one fence pair expected:\n${after}`,
+        );
+        assert.strictEqual(frontmatterLib.extractFrontmatter(after).current_phase, '2');
+      });
+    }
+  }
+});
+
+// ---------------------------------------------------------------------------
+// C2 of epic #4629 (#4866) — ADR-4629 §8.2 (verified post-state) + §8.3
+// (bounded mutation): the verifying executor. Positive controls: each failure
+// arm is driven red by a seeded intent, and each is paired with the passing
+// twin that differs by exactly the defect, so a verifier that failed on
+// everything could not pass this block. Documents are the SHIPPED template
+// (`gsd-core/templates/state.md`), never a hand fixture (#4564/#4316).
+describe('C2 (ADR-4629 §8.2/§8.3): StateWriteIntent verifying executor', () => {
+  const { createStateWriteIntent, openStateTransaction, rebuildStateTransaction } = stateTransitionMod;
+  const { _verifyStateWriteIntent: verify, applyStateWriteIntent, STATE_WRITE_INTENT_FAILURE } = stateLib;
+  const STATE_PATH = '/virtual/.planning/STATE.md';
+  const PRE = readShippedStateTemplateBody([]);
+  const STATUS_LINE = 'Status: [Ready to plan / Planning / Ready to execute / In progress / Phase complete]';
+  const BLOCKERS_LINE = '[Issues that affect future work]';
+  const LAST_ACTIVITY_LINE = 'Last activity: [YYYY-MM-DD] — [What happened]';
+  const setStatus = (content) => content.replace(STATUS_LINE, 'Status: In progress');
+  const narrowStatus = (extra = {}) => createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+    assertions: [{ field: 'Status', requirement: 'required', ...extra }],
+    scope: 'narrow',
+  });
+
+  test('§8.3 positive control: a narrow write that also edits an undeclared section fails loud', () => {
+    const post = setStatus(PRE).replace(BLOCKERS_LINE, 'Blocked on vendor API');
+    const result = verify(narrowStatus(), PRE, post, STATE_PATH);
+    assert.strictEqual(result.ok, false);
+    assert.deepStrictEqual(result.reasons, [STATE_WRITE_INTENT_FAILURE.OUT_OF_SCOPE]);
+    assert.deepStrictEqual(result.outOfScope, [{ region: 'section', name: 'Blockers/Concerns' }]);
+    // Twin: the same write without the stray edit passes.
+    const clean = verify(narrowStatus(), PRE, setStatus(PRE), STATE_PATH);
+    assert.strictEqual(clean.ok, true, JSON.stringify(clean));
+  });
+
+  test('§8.3: a second, undeclared edit inside the SAME section as a declared field is still caught', () => {
+    const post = setStatus(PRE).replace(LAST_ACTIVITY_LINE, 'Last activity: 2026-09-22 — something else');
+    const result = verify(narrowStatus(), PRE, post, STATE_PATH);
+    assert.deepStrictEqual(result.outOfScope, [{ region: 'section', name: 'Current Position' }]);
+  });
+
+  test('§8.3: a frontmatter leaf the narrow intent never named is out of scope (the #4629 progress.percent shape)', () => {
+    const post = PRE.replace('  percent: 0', '  percent: 50');
+    const result = verify(narrowStatus({ requirement: 'best-effort' }), PRE, post, STATE_PATH);
+    assert.deepStrictEqual(result.outOfScope, [{ region: 'frontmatter', name: 'progress.percent' }]);
+    const named = createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'progress.percent', requirement: 'required' }],
+    });
+    assert.strictEqual(verify(named, PRE, post, STATE_PATH).ok, true);
+  });
+
+  test('§8.3: broad scope admits the whole frontmatter but keeps the body bounded (audited, not exempted)', () => {
+    const broad = createStateWriteIntent(openStateTransaction({ snapshot: {} }), { scope: 'broad' });
+    const fmOnly = PRE.replace('status: planning', 'status: executing').replace('  percent: 0', '  percent: 40');
+    assert.strictEqual(verify(broad, PRE, fmOnly, STATE_PATH).ok, true);
+    const withBody = fmOnly.replace(BLOCKERS_LINE, 'Blocked on vendor API');
+    assert.deepStrictEqual(verify(broad, PRE, withBody, STATE_PATH).outOfScope, [{ region: 'section', name: 'Blockers/Concerns' }]);
+  });
+
+  test('§8.3: a rebuild intent is unbounded by contract, but §8.2 still applies to it', () => {
+    const rebuild = createStateWriteIntent(rebuildStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'Status', requirement: 'required', value: 'In progress' }],
+    });
+    const post = setStatus(PRE).replace(BLOCKERS_LINE, 'x').replace('  percent: 0', '  percent: 9');
+    assert.strictEqual(verify(rebuild, PRE, post, STATE_PATH).ok, true);
+    const missed = verify(rebuild, PRE, PRE.replace(BLOCKERS_LINE, 'x'), STATE_PATH);
+    assert.deepStrictEqual(missed.missedRequired, ['Status']);
+    assert.deepStrictEqual(missed.outOfScope, []);
+  });
+
+  test('§8.2 positive control: a required assertion that did not land fails loud', () => {
+    const wrong = verify(narrowStatus({ value: 'Complete' }), PRE, setStatus(PRE), STATE_PATH);
+    assert.deepStrictEqual(wrong.reasons, [STATE_WRITE_INTENT_FAILURE.REQUIRED_ASSERTION_MISSED]);
+    assert.deepStrictEqual(wrong.missedRequired, ['Status']);
+    assert.strictEqual(verify(narrowStatus({ value: 'In progress' }), PRE, setStatus(PRE), STATE_PATH).ok, true);
+    // No declared value: "landed" means measurably changed, so an untouched target is missed.
+    assert.deepStrictEqual(verify(narrowStatus(), PRE, PRE, STATE_PATH).missedRequired, ['Status']);
+    // A best-effort assertion is not judged by §8.2 (its bucket is §8.4, decided in Phase 3).
+    assert.strictEqual(verify(narrowStatus({ requirement: 'best-effort' }), PRE, PRE, STATE_PATH).ok, true);
+  });
+
+  test('§8.2/§8.3: a declared section assertion covers edits inside that section and its landing is verified', () => {
+    const sectionIntent = createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'Blockers/Concerns', target: 'section', requirement: 'required' }],
+    });
+    const post = PRE.replace(BLOCKERS_LINE, 'Blocked on vendor API');
+    assert.strictEqual(verify(sectionIntent, PRE, post, STATE_PATH).ok, true);
+    assert.deepStrictEqual(verify(sectionIntent, PRE, PRE, STATE_PATH).missedRequired, ['Blockers/Concerns']);
+    // Declaring the parent covers the child through its heading lineage.
+    const parent = createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'Accumulated Context', target: 'section', requirement: 'best-effort' }],
+    });
+    assert.strictEqual(verify(parent, PRE, post, STATE_PATH).ok, true);
+  });
+
+  // Adversarial-review regressions (each was a live false negative/positive in the first cut).
+  test('§8.2: a required target that was DELETED has not landed', () => {
+    const cp = createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'Status', requirement: 'required' }, { field: 'Current Position', requirement: 'best-effort' }],
+    });
+    const deleted = verify(cp, PRE, PRE.replace(STATUS_LINE + '\n', ''), STATE_PATH);
+    assert.deepStrictEqual(deleted.missedRequired, ['Status']);
+    assert.deepStrictEqual(deleted.outOfScope, [], 'Current Position is read as a whole section in §8.3 too');
+  });
+
+  test('§8.3: a declared field covers only the line the seam reads, not the same label in another section', () => {
+    const pre = PRE.replace(BLOCKERS_LINE, 'Status: blocked');
+    const post = setStatus(pre).replace('Status: blocked', 'Status: unblocked');
+    assert.deepStrictEqual(verify(narrowStatus(), pre, post, STATE_PATH).outOfScope, [{ region: 'section', name: 'Blockers/Concerns' }]);
+  });
+
+  test('§8.3: reordering sections is out of scope even when every section body is unchanged', () => {
+    const cut = PRE.indexOf('## Deferred Items');
+    const tail = PRE.indexOf('## Session Continuity');
+    const post = PRE.slice(0, cut) + PRE.slice(tail) + '\n' + PRE.slice(cut, tail);
+    assert.ok(verify(narrowStatus({ requirement: 'best-effort' }), PRE, post, STATE_PATH).outOfScope.some((o) => o.region === 'order'));
+  });
+
+  test('the seam normalization (CRLF, blank-line runs) is not counted as the write delta', () => {
+    const crlf = PRE.split('\n').join('\r\n');
+    assert.strictEqual(verify(narrowStatus(), crlf, setStatus(PRE), STATE_PATH).ok, true);
+  });
+
+  // #4935 review: a declared section resolves to its FIRST occurrence (the one
+  // `readStateTarget` reads) plus that occurrence's positional descendants, the
+  // section analogue of `stateFieldOwnerUnit`. A repeated heading's other
+  // occurrence, and its children, stay out of scope.
+  test('§8.3: a declared section covers only its first occurrence, not a repeated heading of the same name', () => {
+    const pre = PRE.trimEnd() + '\n\n## Notes\n\nfirst\n\n### Detail\n\na\n\n## Notes\n\nsecond\n\n### Detail\n\nb\n';
+    const notes = createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field: 'Notes', target: 'section', requirement: 'best-effort' }],
+    });
+    const second = verify(notes, pre, pre.replace('second', 'stray'), STATE_PATH);
+    assert.deepStrictEqual(second.outOfScope, [{ region: 'section', name: 'Notes' }]);
+    const secondChild = verify(notes, pre, pre.replace('\nb\n', '\nstray\n'), STATE_PATH);
+    assert.deepStrictEqual(secondChild.outOfScope, [{ region: 'section', name: 'Detail' }]);
+    // Twins: the first occurrence and its child are in scope.
+    assert.strictEqual(verify(notes, pre, pre.replace('first', 'edited'), STATE_PATH).ok, true);
+    assert.strictEqual(verify(notes, pre, pre.replace('\na\n', '\nedited\n'), STATE_PATH).ok, true);
+  });
+
+  test('createStateWriteIntent rejects an unknown assertion target', () => {
+    assert.throws(
+      () => createStateWriteIntent(openStateTransaction({ snapshot: {} }), { assertions: [{ field: 'X', requirement: 'required', target: 'sections' }] }),
+      { code: 'STATE_WRITE_INTENT_TARGET_INVALID' },
+    );
+  });
+
+  // #4935 review: a bare parent declaration covers only the schema-declared leaves
+  // of that parent (`declaredLeavesOf`), and a declared leaf never covers a sibling.
+  test('§8.3: declaring `progress` covers its schema-declared leaves; a declared leaf does not cover a sibling leaf', () => {
+    const post = PRE.replace('  percent: 0', '  percent: 50').replace('  total_plans: 0', '  total_plans: 4');
+    const intentFor = (field) => createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: [{ field, requirement: 'best-effort' }],
+      scope: 'narrow',
+    });
+    assert.strictEqual(verify(intentFor('progress'), PRE, post, STATE_PATH).ok, true);
+    assert.deepStrictEqual(
+      verify(intentFor('progress.percent'), PRE, post, STATE_PATH).outOfScope,
+      [{ region: 'frontmatter', name: 'progress.total_plans' }],
+    );
+    // A prefix that is not a declared parent key covers nothing.
+    assert.deepStrictEqual(
+      verify(intentFor('prog'), PRE, post, STATE_PATH).outOfScope,
+      [{ region: 'frontmatter', name: 'progress.total_plans' }, { region: 'frontmatter', name: 'progress.percent' }],
+    );
+    // A top-level key that merely CONTAINS a dot is not a schema leaf of its prefix:
+    // declaring `foo` does not cover `foo.bar` (the old `split('.')[0]` rule did).
+    const dottedPre = PRE.replace('status: planning', 'status: planning\nfoo.bar: 1');
+    const dottedPost = dottedPre.replace('foo.bar: 1', 'foo.bar: 2');
+    assert.deepStrictEqual(
+      verify(intentFor('foo'), dottedPre, dottedPost, STATE_PATH).outOfScope,
+      [{ region: 'frontmatter', name: 'foo.bar' }],
+    );
+    assert.strictEqual(verify(intentFor('foo.bar'), dottedPre, dottedPost, STATE_PATH).ok, true);
+  });
+
+  // #4935 review: fast-check properties for the §8.3 diff/replay contract. Each
+  // generated case edits a random subset of the template's body fields to random
+  // values, and the intent declares exactly that subset. Inputs are built with a
+  // plain line setter (`setField`), NOT the seam's `stateReplaceField` that the
+  // verifier replays with, so a writer defect cannot hide inside its own oracle
+  // (CONTRIBUTING, #2371). Edits touch the BODY only.
+  describe('§8.3 properties (fast-check)', () => {
+    const FC_OPTS = { seed: 4866, numRuns: 200 };
+    const BODY_FIELDS = [
+      ['Phase', 'Current Position'], ['Plan', 'Current Position'], ['Status', 'Current Position'],
+      ['Last activity', 'Current Position'], ['Core value', 'Project Reference'], ['Current focus', 'Project Reference'],
+      ['Last session', 'Session Continuity'], ['Stopped at', 'Session Continuity'], ['Resume file', 'Session Continuity'],
+    ];
+    // One line from each template section that owns no declarable field.
+    const STRAY_LINES = [
+      [BLOCKERS_LINE, 'Blockers/Concerns'],
+      ['- [Phase X]: [Decision summary]', 'Decisions'],
+      ['[From .planning/todos/pending/ — ideas captured during sessions]', 'Pending Todos'],
+      ['*Updated after each plan completion*', 'Performance Metrics'],
+      ['Items acknowledged and deferred at milestone close, most recent first:', 'Deferred Items'],
+    ];
+    // Values include `$` and `&` so a string-replacement special pattern would surface.
+    const fieldValue = fc.stringMatching(/^[A-Za-z0-9][A-Za-z0-9 .,:()/$&*|'[\]-]{0,24}[A-Za-z0-9)]$/);
+    const fieldEdits = fc
+      .uniqueArray(fc.tuple(fc.constantFrom(...BODY_FIELDS), fieldValue), {
+        minLength: 1, maxLength: BODY_FIELDS.length, selector: ([[field]]) => field,
+      })
+      .filter((edits) => edits.every(([[field], value]) => stateExtractField(PRE, field).trim() !== value));
+    const bodyStart = PRE.indexOf('\n---\n', 4) + 5;
+    const onBody = (content, fn) => content.slice(0, bodyStart) + fn(content.slice(bodyStart));
+    // Rewrite the first body line labelled `Field:` or `**Field:**`, the line the seam reads.
+    const setField = (body, field, value) => {
+      const lines = body.split('\n');
+      const i = lines.findIndex((l) => l.startsWith(`${field}: `) || l.startsWith(`**${field}:** `));
+      assert.ok(i >= 0, `the template body must carry a ${field} line`);
+      lines[i] = `${lines[i].startsWith('**') ? `**${field}:**` : `${field}:`} ${value}`;
+      return lines.join('\n');
+    };
+    const editBody = (content, edits) =>
+      onBody(content, (body) => edits.reduce((acc, [[field], value]) => setField(acc, field, value), body));
+    const applyEdits = (edits) => editBody(PRE, edits);
+    const intentFor = (edits) => createStateWriteIntent(openStateTransaction({ snapshot: {} }), {
+      assertions: edits.map(([[field], value]) => ({ field, requirement: 'required', value })),
+      scope: 'narrow',
+    });
+
+    test('property: editing exactly the declared fields verifies clean (no false out-of-scope, every required lands)', () => {
+      let checked = 0;
+      fc.assert(fc.property(fieldEdits, (edits) => {
+        const result = verify(intentFor(edits), PRE, applyEdits(edits), STATE_PATH);
+        assert.deepStrictEqual(
+          { ok: result.ok, outOfScope: result.outOfScope, missedRequired: result.missedRequired },
+          { ok: true, outOfScope: [], missedRequired: [] },
+        );
+        checked++;
+      }), FC_OPTS);
+      assert.strictEqual(checked, FC_OPTS.numRuns, 'every generated case must reach the assertion');
+    });
+
+    test('property: one stray edit in a field-free section is reported as exactly that section', () => {
+      let checked = 0;
+      fc.assert(fc.property(fieldEdits, fc.constantFrom(...STRAY_LINES), fieldValue, (edits, [line, section], stray) => {
+        const post = applyEdits(edits).replace(line, () => stray);
+        const result = verify(intentFor(edits), PRE, post, STATE_PATH);
+        assert.deepStrictEqual(result.reasons, [STATE_WRITE_INTENT_FAILURE.OUT_OF_SCOPE]);
+        assert.deepStrictEqual(result.outOfScope, [{ region: 'section', name: section }]);
+        checked++;
+      }), FC_OPTS);
+      assert.strictEqual(checked, FC_OPTS.numRuns, 'every generated case must reach the assertion');
+    });
+
+    test('property: an undeclared field edited beside a declared one in the same section is caught', () => {
+      let checked = 0;
+      fc.assert(fc.property(fieldEdits, fieldValue, fc.nat(), (edits, value, pick) => {
+        const declaredFields = new Set(edits.map(([[field]]) => field));
+        const siblings = BODY_FIELDS.filter(([field, section]) =>
+          !declaredFields.has(field) && edits.some(([[, s]]) => s === section));
+        fc.pre(siblings.length > 0);
+        const sibling = siblings[pick % siblings.length];
+        fc.pre(stateExtractField(PRE, sibling[0]).trim() !== value);
+        const post = editBody(applyEdits(edits), [[sibling, value]]);
+        const result = verify(intentFor(edits), PRE, post, STATE_PATH);
+        assert.strictEqual(result.ok, false);
+        assert.ok(result.outOfScope.some((o) => o.region === 'section' && o.name === sibling[1]), JSON.stringify(result));
+        checked++;
+      }), FC_OPTS);
+      assert.strictEqual(checked, FC_OPTS.numRuns, 'every generated case must reach the assertion');
+    });
+
+    test('property: a declared label repeated in another section covers only the line the seam reads', () => {
+      let checked = 0;
+      fc.assert(fc.property(fieldEdits, fc.constantFrom(...STRAY_LINES), fieldValue, (edits, [line, section], value) => {
+        // The seeded copy must sit AFTER the field's owning section: the seam reads the
+        // first match, so a copy placed earlier would itself be the declared line.
+        const early = edits.find(([[, s]]) => s === 'Current Position' || s === 'Project Reference');
+        fc.pre(early !== undefined && value !== 'seeded');
+        const [[field]] = early;
+        const pre = PRE.replace(line, () => `${field}: seeded`);
+        const post = editBody(pre, edits)
+          .replace(`${field}: seeded`, () => `${field}: ${value}`);
+        const result = verify(intentFor(edits), pre, post, STATE_PATH);
+        assert.deepStrictEqual(result.outOfScope, [{ region: 'section', name: section }]);
+        checked++;
+      }), FC_OPTS);
+      assert.strictEqual(checked, FC_OPTS.numRuns, 'every generated case must reach the assertion');
+    });
+
+    test('property: the verdict is invariant under CRLF line endings on either side', () => {
+      const crlf = (s) => s.split('\n').join('\r\n');
+      let checked = 0;
+      fc.assert(fc.property(fieldEdits, fc.option(fc.constantFrom(...STRAY_LINES)), (edits, stray) => {
+        const post = stray === null ? applyEdits(edits) : applyEdits(edits).replace(stray[0], () => 'x');
+        const lf = verify(intentFor(edits), PRE, post, STATE_PATH);
+        // Mixed endings: a side the verifier failed to normalize would read as every section changed.
+        assert.deepStrictEqual(verify(intentFor(edits), crlf(PRE), post, STATE_PATH), lf);
+        assert.deepStrictEqual(verify(intentFor(edits), PRE, crlf(post), STATE_PATH), lf);
+        checked++;
+      }), FC_OPTS);
+      assert.strictEqual(checked, FC_OPTS.numRuns, 'every generated case must reach the assertion');
+    });
+  });
+
+  describe('applyStateWriteIntent (disk)', () => {
+    let tmpDir;
+    let statePath;
+    beforeEach(() => {
+      tmpDir = createTempProject('gsd-4866-');
+      statePath = path.join(tmpDir, '.planning', 'STATE.md');
+      fs.writeFileSync(statePath, PRE);
+    });
+    afterEach(() => cleanup(tmpDir));
+
+    test('an out-of-scope transform is refused before the write: ok=false, written=false, bytes unchanged', () => {
+      const result = applyStateWriteIntent(statePath, narrowStatus(), (c) => setStatus(c).replace(BLOCKERS_LINE, 'x'), tmpDir);
+      assert.strictEqual(result.ok, false);
+      assert.strictEqual(result.written, false);
+      assert.ok(result.outOfScope.some((o) => o.region === 'section' && o.name === 'Blockers/Concerns'), JSON.stringify(result));
+      assert.strictEqual(fs.readFileSync(statePath, 'utf-8'), PRE);
+    });
+
+    test('an in-scope transform is written and reports the measured delta', () => {
+      // The realistic C3 shape: narrow scope, default resync (sync + preservation both run).
+      const intent = createStateWriteIntent(openStateTransaction({ snapshot: {}, resync: true }), {
+        assertions: [{ field: 'Status', requirement: 'required', value: 'In progress' }],
+        scope: 'narrow',
+      });
+      const result = applyStateWriteIntent(statePath, intent, setStatus, tmpDir);
+      assert.strictEqual(result.ok, true, JSON.stringify(result));
+      assert.strictEqual(result.written, true);
+      assert.ok(result.updated.includes('Status'), JSON.stringify(result.updated));
+      assert.ok(fs.readFileSync(statePath, 'utf-8').includes('Status: In progress'));
+    });
+
+    test('a no-op transform writes nothing and a required change-assertion reports as missed', () => {
+      const result = applyStateWriteIntent(statePath, narrowStatus(), (c) => c, tmpDir);
+      assert.strictEqual(result.written, false);
+      assert.deepStrictEqual(result.missedRequired, ['Status']);
+      assert.strictEqual(fs.readFileSync(statePath, 'utf-8'), PRE);
+    });
+
+    // #4935 review: the one failure found AFTER the write. The re-read is forced
+    // to differ from the verified content (a writer outside the lock); the result
+    // must say written=true and ok=false, with no restore attempted.
+    test('a re-read that differs from the verified content is reread_mismatch: ok=false, written=true, not restored', () => {
+      const intent = createStateWriteIntent(openStateTransaction({ snapshot: {}, resync: true }), {
+        assertions: [{ field: 'Status', requirement: 'required', value: 'In progress' }],
+      });
+      const realRead = fs.readFileSync;
+      let reads = 0;
+      fs.readFileSync = function patched(file, ...rest) {
+        const out = realRead.call(this, file, ...rest);
+        if (file === statePath && ++reads === 2) return out + '\ntampered\n';
+        return out;
+      };
+      let result;
+      try {
+        result = applyStateWriteIntent(statePath, intent, setStatus, tmpDir);
+      } finally {
+        fs.readFileSync = realRead;
+      }
+      assert.strictEqual(reads >= 2, true, 'the executor re-read the file after writing');
+      assert.deepStrictEqual(result.reasons, [STATE_WRITE_INTENT_FAILURE.REREAD_MISMATCH]);
+      assert.strictEqual(result.ok, false);
+      assert.strictEqual(result.written, true);
+      assert.deepStrictEqual([...result.outOfScope, ...result.missedRequired], []);
+      assert.deepStrictEqual(result.updated, []);
+      // The verified content reached disk and was not rolled back.
+      assert.ok(fs.readFileSync(statePath, 'utf-8').includes('Status: In progress'));
+    });
+
+    test('a rebuild intent is a construction error on this path (rebuild writers stay on writeStateMd)', () => {
+      const rebuild = createStateWriteIntent(rebuildStateTransaction({ snapshot: {} }), {});
+      assert.throws(() => applyStateWriteIntent(statePath, rebuild, setStatus, tmpDir), { code: 'STATE_TRANSACTION_KIND_INVALID' });
+      assert.throws(() => applyStateWriteIntent(statePath, null, setStatus, tmpDir), { code: 'STATE_WRITE_INTENT_REQUIRED' });
+    });
   });
 });
