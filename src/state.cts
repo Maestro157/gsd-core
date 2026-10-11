@@ -1601,9 +1601,13 @@ function cmdStateAddDecision(cwd: string, options: StateAddDecisionOptions, raw:
 
   const { phase, summary, summary_file, rationale, rationale_file } = options;
   const summaryText = readTextArgOrFile(cwd, summary, summary_file, 'summary');
-  const rationaleText = readTextArgOrFile(cwd, rationale || '', rationale_file, 'rationale') || '';
+  // The rationale is optional: blank, inline or file, means "no rationale".
+  const rationaleInput = readTextArgOrFile(cwd, rationale || '', rationale_file, 'rationale') || '';
+  const rationaleText = rationaleInput.trim() ? rationaleInput : '';
 
-  if (!summaryText) return error('summary required — pass --summary, or a non-empty --summary-file', ERROR_REASON.USAGE);
+  // A blank inline value is refused the same as a blank file (the file form is
+  // trimEnd()ed by readTextArgOrFile, the inline form is not).
+  if (!summaryText || !summaryText.trim()) return error('summary required — pass a non-blank --summary or --summary-file', ERROR_REASON.USAGE);
 
   // #3231/#3481: `--phase` omitted → resolve from the STATE.md being written, via
   // the canonical ladder `state prune` uses. A decision entry is a permanent
@@ -1680,7 +1684,7 @@ function cmdStateAddBlocker(cwd: string, text: string | StateAddBlockerOptions, 
   const blockerOptions: StateAddBlockerOptions = typeof text === 'object' && text !== null ? text : { text: text };
   const blockerText = readTextArgOrFile(cwd, blockerOptions.text, blockerOptions.text_file, 'text');
 
-  if (!blockerText) return error('text required — pass --text, or a non-empty --text-file', ERROR_REASON.USAGE);
+  if (!blockerText || !blockerText.trim()) return error('text required — pass a non-blank --text or --text-file', ERROR_REASON.USAGE);
 
   const entry = `- ${blockerText}`;
   let _added = false;
@@ -1743,7 +1747,7 @@ function cmdStateAddRoadmapEvolution(cwd: string, options: StateAddRoadmapEvolut
   const noteText = readTextArgOrFile(cwd, note, note_file, 'note');
   // Reject missing / empty / whitespace-only notes — an evolution entry with no
   // narrative is meaningless and would corrupt the section with a dangling bullet.
-  if (!noteText || !noteText.trim()) return error('note required — pass --note, or a non-empty --note-file', ERROR_REASON.USAGE);
+  if (!noteText || !noteText.trim()) return error('note required — pass a non-blank --note or --note-file', ERROR_REASON.USAGE);
   // Flatten line breaks so the entry is always a single Markdown bullet. The
   // dedupe + rendering contract is line-oriented; a multiline --note-file would
   // otherwise spill continuation lines outside the bullet and defeat dedupe.

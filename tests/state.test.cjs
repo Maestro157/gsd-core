@@ -806,6 +806,27 @@ None
       }
     }
 
+    // The inline form of a required field follows the same rule as the file form:
+    // a whitespace-only `--summary` / `--text` used to be written as a blank
+    // bullet at exit 0, while `--note` and every blank file were refused.
+    const requiredInline = [
+      { flag: '--summary', field: 'summary', argv: (v) => ['state', 'add-decision', '--phase', '3', '--summary', v] },
+      { flag: '--text', field: 'text', argv: (v) => ['state', 'add-blocker', '--text', v] },
+      { flag: '--note', field: 'note', argv: (v) => ['state', 'add-roadmap-evolution', '--phase', '3', '--note', v] },
+    ];
+
+    for (const r of requiredInline) {
+      test(`a whitespace-only inline ${r.flag} exits 1 with reason usage and leaves STATE.md untouched`, () => {
+        const result = runGsdTools([...r.argv('  \t '), '--json-errors'], tmpDir);
+
+        assert.strictEqual(result.exitCode, 1, `refusal must exit non-zero; stdout: ${result.output}`);
+        const envelope = JSON.parse(result.error);
+        assert.strictEqual(envelope.reason, ERROR_REASON.USAGE);
+        assert.ok(envelope.message.startsWith(`${r.field} required`), `got: ${envelope.message}`);
+        assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
+      });
+    }
+
     // The rationale is optional: an empty --rationale-file means "no rationale",
     // exactly as `--rationale ""` does, so the decision is still written.
     test('an empty --rationale-file is not a refusal: the decision is written without a rationale', () => {
@@ -817,6 +838,24 @@ None
       assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
       assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: Chosen' });
     });
+
+    // Same parity for the optional field: a whitespace-only rationale, inline or
+    // file, is "no rationale" rather than a dangling ` — ` suffix.
+    for (const form of [
+      { name: 'inline --rationale', argv: () => ['--rationale', '  \t '] },
+      { name: '--rationale-file', argv: () => {
+        const file = path.join(outsideDir, 'rationale.md');
+        fs.writeFileSync(file, '  \n\t\n');
+        return ['--rationale-file', file];
+      } },
+    ]) {
+      test(`a whitespace-only ${form.name} writes the decision without a rationale`, () => {
+        const result = runGsdTools(['state', 'add-decision', '--phase', '3', '--summary', 'Chosen', ...form.argv()], tmpDir);
+
+        assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
+        assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: Chosen' });
+      });
+    }
 
     const verbs = [
       { name: 'add-decision', argv: ['state', 'add-decision', '--phase', '3', '--summary', 'Chosen'] },
