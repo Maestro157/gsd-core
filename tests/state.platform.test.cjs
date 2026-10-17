@@ -76,8 +76,8 @@ describe('#4926 text-file inputs: any readable file is accepted; every refusal e
   const { createFixture } = require('./fixtures/index.cjs');
   const { ERROR_REASON } = require('../gsd-core/bin/lib/io.cjs');
   // A single `mkfifo` call creates the FIFO fixture.
-  const { runHook } = require('./helpers/process-seam.cjs');
-  const MKFIFO_TIMEOUT_MS = 15000;
+  const { execFileSync } = require('node:child_process');
+  const { PROBE_TIMEOUT_MS } = require('./helpers/timeouts.cjs');
 
   let tmpDir;
   let outsideDir;
@@ -125,19 +125,21 @@ None
     // Without the regular-file check, opening a FIFO with no writer blocks
     // forever and runGsdTools throws on the subprocess timeout.
     test(`${f.name} naming a FIFO is refused without blocking`, (t) => {
-      const fifo = path.join(outsideDir, 'entry.fifo');
-      if (process.platform === 'win32' || runHook(fifo, [], { interpreter: 'mkfifo', timeoutMs: MKFIFO_TIMEOUT_MS }).exitCode !== 0) {
-        t.skip('mkfifo unavailable on this platform');
+      if (process.platform === 'win32') {
+        t.skip('no FIFOs on Windows');
         return;
       }
+      const fifo = path.join(outsideDir, 'entry.fifo');
+      // Throws when mkfifo fails, so on POSIX this row never passes without a FIFO.
+      execFileSync('mkfifo', [fifo], { stdio: 'ignore', timeout: PROBE_TIMEOUT_MS });
 
       assertRefused(runGsdTools([...f.argv(fifo), '--json-errors'], tmpDir), f.flag, 'not a regular file');
     });
 
     // /dev/zero never reaches EOF: an unbounded read exhausts memory.
     test(`${f.name} naming /dev/zero is refused without reading it`, (t) => {
-      if (process.platform === 'win32' || !fs.existsSync('/dev/zero')) {
-        t.skip('no /dev/zero on this platform');
+      if (process.platform === 'win32') {
+        t.skip('no /dev/zero on Windows');
         return;
       }
 
