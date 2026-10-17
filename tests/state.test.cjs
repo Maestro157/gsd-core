@@ -34,9 +34,6 @@ const stateTransitionMod = require('../gsd-core/bin/lib/state-transition.cjs');
 const stateDocument = require('../gsd-core/bin/lib/state-document.cjs');
 // #3699: the repo's one metacharacter-escape helper (local/no-adhoc-regex-escape).
 const { escapeRegex } = require('../gsd-core/bin/lib/pattern.cjs');
-// #4926: a single `mkfifo` call creates the FIFO fixture for the text-file rows.
-const { runHook } = require('./helpers/process-seam.cjs');
-const MKFIFO_TIMEOUT_MS = 15000;
 const frontmatterLib = require('../gsd-core/bin/lib/frontmatter.cjs');
 const { SCOPE } = require('../gsd-core/bin/lib/planning-scope.cjs');
 const workstreamInventory = require('../gsd-core/bin/lib/workstream-inventory.cjs');
@@ -913,8 +910,7 @@ None
     });
 
     // An unconfined path is hostile input, so the read is bounded: a file over
-    // the documented 256 KiB cap is refused without being read, and a FIFO or a
-    // device is refused instead of blocking on open or reading forever.
+    // the documented 256 KiB cap is refused without being read whole.
     const TEXT_FILE_MAX_BYTES = 256 * 1024;
 
     const assertRefused = (result, flag, why) => {
@@ -950,29 +946,8 @@ None
 
         assertRefused(runGsdTools([...f.argv(file), '--json-errors'], tmpDir), f.flag, `larger than ${TEXT_FILE_MAX_BYTES} bytes`);
       });
-
-      // Without the regular-file check, opening a FIFO with no writer blocks
-      // forever and runGsdTools throws on the subprocess timeout.
-      test(`${f.name} naming a FIFO is refused without blocking`, (t) => {
-        const fifo = path.join(outsideDir, 'entry.fifo');
-        if (process.platform === 'win32' || runHook(fifo, [], { interpreter: 'mkfifo', timeoutMs: MKFIFO_TIMEOUT_MS }).exitCode !== 0) {
-          t.skip('mkfifo unavailable on this platform');
-          return;
-        }
-
-        assertRefused(runGsdTools([...f.argv(fifo), '--json-errors'], tmpDir), f.flag, 'not a regular file');
-      });
-
-      // /dev/zero never reaches EOF: an unbounded read exhausts memory.
-      test(`${f.name} naming /dev/zero is refused without reading it`, (t) => {
-        if (process.platform === 'win32' || !fs.existsSync('/dev/zero')) {
-          t.skip('no /dev/zero on this platform');
-          return;
-        }
-
-        assertRefused(runGsdTools([...f.argv('/dev/zero'), '--json-errors'], tmpDir), f.flag, 'not a regular file');
-      });
     }
+    // The FIFO and device rows need a real OS and live in tests/state.platform.test.cjs.
   });
 });
 
