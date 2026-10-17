@@ -16,6 +16,9 @@ const { output, error, declineNoOp, formatDiagnosticToken, ERROR_REASON } = ioMo
 import cliExitModule = require('./cli-exit.cjs');
 const { ExitError } = cliExitModule;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
+import capabilityLedgerMod = require('./capability-ledger.cjs');
+const { readSmallRegularFile } = capabilityLedgerMod;
+// eslint-disable-next-line @typescript-eslint/no-require-imports
 import stateContract = require('./state-contract.cjs');
 const { publishStateContract } = stateContract;
 // eslint-disable-next-line @typescript-eslint/no-require-imports
@@ -616,6 +619,13 @@ function cmdStateGet(cwd: string, section: string | undefined, raw: boolean): vo
 }
 
 /**
+ * #4926: cap on a `--<flag>-file` text input. Twice the 128 KiB one argv string
+ * can carry on Linux, so the file form never takes less than the inline form,
+ * and the entry echoed back on stdout stays small.
+ */
+const TEXT_FILE_MAX_BYTES = 256 * 1024;
+
+/**
  * Resolve a text argument that may instead be supplied as a file (`--<flag>`
  * or `--<flag>-file`).
  *
@@ -629,19 +639,31 @@ function cmdStateGet(cwd: string, section: string | undefined, raw: boolean): vo
  * path — stderr, non-zero exit (USAGE), `--json-errors` envelope — rather than
  * an `{ added: false }` payload at exit 0 that a shell caller gating on `$?`
  * reads as success while nothing was written.
+ *
+ * An unconfined path is hostile input, so the read goes through
+ * `readSmallRegularFile`: a FIFO, a device (`/dev/zero`, a piped `/dev/stdin`)
+ * or a directory is refused without blocking, and a file over
+ * TEXT_FILE_MAX_BYTES is refused without being read.
  */
 function readTextArgOrFile(cwd: string, value: string | undefined, filePath: string | undefined, flag: string): string | undefined {
   if (!filePath) return value;
 
+  const refuse = (why: string | undefined): never => error(
+    `--${flag}-file could not be read: ${formatDiagnosticToken(filePath)}${why ? ` (${why})` : ''}`,
+    ERROR_REASON.USAGE,
+  );
+
+  let content: string | null;
   try {
-    return fs.readFileSync(path.resolve(cwd, filePath), 'utf-8').trimEnd();
+    content = readSmallRegularFile(path.resolve(cwd, filePath), TEXT_FILE_MAX_BYTES);
   } catch (err) {
     const code = (err as NodeJS.ErrnoException).code;
-    return error(
-      `--${flag}-file could not be read: ${formatDiagnosticToken(filePath)}${code ? ` (${code})` : ''}`,
-      ERROR_REASON.USAGE,
-    );
+    if (code === 'EFBIG') return refuse(`larger than ${TEXT_FILE_MAX_BYTES} bytes`);
+    if (code === 'EISDIR' || code === 'ENXIO') return refuse('not a regular file');
+    return refuse(code);
   }
+  if (content === null) return refuse('ENOENT');
+  return content.trimEnd();
 }
 
 function cmdStatePatch(cwd: string, patches: Record<string, string>, raw: boolean): void {

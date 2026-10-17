@@ -34,6 +34,9 @@ const stateTransitionMod = require('../gsd-core/bin/lib/state-transition.cjs');
 const stateDocument = require('../gsd-core/bin/lib/state-document.cjs');
 // #3699: the repo's one metacharacter-escape helper (local/no-adhoc-regex-escape).
 const { escapeRegex } = require('../gsd-core/bin/lib/pattern.cjs');
+// #4926: a single `mkfifo` call creates the FIFO fixture for the text-file rows.
+const { runHook } = require('./helpers/process-seam.cjs');
+const MKFIFO_TIMEOUT_MS = 15000;
 const frontmatterLib = require('../gsd-core/bin/lib/frontmatter.cjs');
 const { SCOPE } = require('../gsd-core/bin/lib/planning-scope.cjs');
 const workstreamInventory = require('../gsd-core/bin/lib/workstream-inventory.cjs');
@@ -908,6 +911,68 @@ None
       assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
       assert.deepStrictEqual(JSON.parse(result.output), { added: true, decision: '- [Phase 3]: Relative entry.' });
     });
+
+    // An unconfined path is hostile input, so the read is bounded: a file over
+    // the documented 256 KiB cap is refused without being read, and a FIFO or a
+    // device is refused instead of blocking on open or reading forever.
+    const TEXT_FILE_MAX_BYTES = 256 * 1024;
+
+    const assertRefused = (result, flag, why) => {
+      assert.strictEqual(result.exitCode, 1, `refusal must exit non-zero; stdout: ${result.output}`);
+      const envelope = JSON.parse(result.error);
+      assert.strictEqual(envelope.reason, ERROR_REASON.USAGE);
+      assert.ok(envelope.message.startsWith(`${flag} could not be read`), `refusal must name the flag; got: ${envelope.message}`);
+      assert.ok(envelope.message.endsWith(`(${why})`), `refusal must say why; got: ${envelope.message}`);
+      assert.strictEqual(fs.readFileSync(statePath(), 'utf-8'), stateBody, 'STATE.md must be byte-identical after a refusal');
+    };
+
+    for (const f of flags) {
+      for (const { name, size } of [
+        { name: 'one byte under the cap', size: TEXT_FILE_MAX_BYTES - 1 },
+        { name: 'exactly the cap', size: TEXT_FILE_MAX_BYTES },
+      ]) {
+        test(`${f.name} accepts a file of ${name}`, () => {
+          const file = path.join(outsideDir, 'entry.md');
+          const text = 'x'.repeat(size);
+          fs.writeFileSync(file, text);
+
+          const result = runGsdTools(f.argv(file), tmpDir);
+
+          assert.strictEqual(result.exitCode, 0, `Command failed: ${result.error}`);
+          assert.strictEqual(JSON.parse(result.output).added, true);
+          assert.ok(fs.readFileSync(statePath(), 'utf-8').includes(text), 'the whole file must reach STATE.md');
+        });
+      }
+
+      test(`${f.name} naming a file one byte over the cap exits 1 with reason usage and leaves STATE.md untouched`, () => {
+        const file = path.join(outsideDir, 'entry.md');
+        fs.writeFileSync(file, 'x'.repeat(TEXT_FILE_MAX_BYTES + 1));
+
+        assertRefused(runGsdTools([...f.argv(file), '--json-errors'], tmpDir), f.flag, `larger than ${TEXT_FILE_MAX_BYTES} bytes`);
+      });
+
+      // Without the regular-file check, opening a FIFO with no writer blocks
+      // forever and runGsdTools throws on the subprocess timeout.
+      test(`${f.name} naming a FIFO is refused without blocking`, (t) => {
+        const fifo = path.join(outsideDir, 'entry.fifo');
+        if (process.platform === 'win32' || runHook(fifo, [], { interpreter: 'mkfifo', timeoutMs: MKFIFO_TIMEOUT_MS }).exitCode !== 0) {
+          t.skip('mkfifo unavailable on this platform');
+          return;
+        }
+
+        assertRefused(runGsdTools([...f.argv(fifo), '--json-errors'], tmpDir), f.flag, 'not a regular file');
+      });
+
+      // /dev/zero never reaches EOF: an unbounded read exhausts memory.
+      test(`${f.name} naming /dev/zero is refused without reading it`, (t) => {
+        if (process.platform === 'win32' || !fs.existsSync('/dev/zero')) {
+          t.skip('no /dev/zero on this platform');
+          return;
+        }
+
+        assertRefused(runGsdTools([...f.argv('/dev/zero'), '--json-errors'], tmpDir), f.flag, 'not a regular file');
+      });
+    }
   });
 });
 
